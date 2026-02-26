@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "io.github.radarroark"
-version = "0.28.0"
+version = "0.29.0"
 description = "An immutable database"
 java.sourceCompatibility = JavaVersion.VERSION_17
 java.targetCompatibility = JavaVersion.VERSION_17
