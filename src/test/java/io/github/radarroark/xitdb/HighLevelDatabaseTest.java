@@ -2,6 +2,7 @@ package io.github.radarroark.xitdb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -12,7 +13,6 @@ import java.io.RandomAccessFile;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-
 import org.junit.jupiter.api.Test;
 
 class HighLevelDatabaseTest {
@@ -877,6 +877,333 @@ class HighLevelDatabaseTest {
             var bigCitiesCursor = moment.getCursor("big-cities");
             var bigCities = new ReadArrayList(bigCitiesCursor);
             assertEquals(2, bigCities.count());
+        }
+    }
+
+    @Test
+    void testCompaction() throws Exception {
+        // memory
+        try (var ram = new RandomAccessMemory()) {
+            var core = new CoreMemory(ram);
+            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+            try (var targetRam = new RandomAccessMemory()) {
+                var targetCore = new CoreMemory(targetRam);
+                testCompaction(core, targetCore, hasher, null, null);
+            }
+        }
+
+        // file
+        {
+            var sourceFile = File.createTempFile("compact_source", ".db");
+            sourceFile.deleteOnExit();
+            var targetFile = File.createTempFile("compact_target", ".db");
+            targetFile.deleteOnExit();
+
+            try (var sourceRaf = new RandomAccessFile(sourceFile, "rw");
+                 var targetRaf = new RandomAccessFile(targetFile, "rw")) {
+                var sourceCore = new CoreFile(sourceRaf);
+                var targetCore = new CoreFile(targetRaf);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
+            }
+        }
+
+        // buffered file
+        {
+            var sourceFile = File.createTempFile("compact_source", ".db");
+            sourceFile.deleteOnExit();
+            var targetFile = File.createTempFile("compact_target", ".db");
+            targetFile.deleteOnExit();
+
+            try (var sourceRaf = new RandomAccessBufferedFile(sourceFile, "rw");
+                 var targetRaf = new RandomAccessBufferedFile(targetFile, "rw")) {
+                var sourceCore = new CoreBufferedFile(sourceRaf);
+                var targetCore = new CoreBufferedFile(targetRaf);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
+            }
+        }
+    }
+
+    void testCompaction(Core sourceCore, Core targetCore, Hasher hasher, File sourceFile, File targetFile) throws Exception {
+        // empty DB compaction
+        {
+            sourceCore.setLength(0);
+            targetCore.setLength(0);
+            var source = new Database(sourceCore, hasher);
+            var compacted = source.compact(targetCore);
+            assertEquals(Tag.NONE, compacted.header.tag());
+        }
+
+        // basic compaction with various data types
+        {
+            sourceCore.setLength(0);
+            targetCore.setLength(0);
+            var source = new Database(sourceCore, hasher);
+
+            // moment 1
+            {
+                var history = new WriteArrayList(source.rootCursor());
+                history.appendContext(history.getSlot(-1), (cursor) -> {
+                    var moment = new WriteHashMap(cursor);
+                    moment.put("key1", new Database.Bytes("value1"));
+                    moment.put("key2", new Database.Uint(100));
+                });
+            }
+
+            // moment 2
+            {
+                var history = new WriteArrayList(source.rootCursor());
+                history.appendContext(history.getSlot(-1), (cursor) -> {
+                    var moment = new WriteHashMap(cursor);
+                    moment.put("key1", new Database.Bytes("updated_value1"));
+                    moment.put("key2", new Database.Uint(200));
+                    moment.put("key3", new Database.Int(-42));
+                    moment.put("key4", new Database.Float(3.14));
+                    moment.put("short", new Database.Bytes("hi"));
+
+                    // long bytes with format_tag
+                    moment.put("tagged", new Database.Bytes("this is a long tagged string!!", "bi"));
+
+                    // ArrayList
+                    var fruitsCursor = moment.putCursor("fruits");
+                    var fruits = new WriteArrayList(fruitsCursor);
+                    fruits.append(new Database.Bytes("apple"));
+                    fruits.append(new Database.Bytes("banana"));
+                    fruits.append(new Database.Bytes("cherry"));
+
+                    // LinkedArrayList
+                    var todosCursor = moment.putCursor("todos");
+                    var todos = new WriteLinkedArrayList(todosCursor);
+                    todos.append(new Database.Bytes("task1"));
+                    todos.append(new Database.Bytes("task2"));
+                    todos.append(new Database.Bytes("task3"));
+
+                    // CountedHashMap
+                    var countedCursor = moment.putCursor("counted");
+                    var counted = new WriteCountedHashMap(countedCursor);
+                    counted.put("a", new Database.Uint(1));
+                    counted.putKey("a", new Database.Bytes("a"));
+                    counted.put("b", new Database.Uint(2));
+                    counted.putKey("b", new Database.Bytes("b"));
+
+                    // HashSet
+                    var setCursor = moment.putCursor("myset");
+                    var set = new WriteHashSet(setCursor);
+                    set.put("x");
+                    set.put("y");
+
+                    // CountedHashSet
+                    var csetCursor = moment.putCursor("mycset");
+                    var cset = new WriteCountedHashSet(csetCursor);
+                    cset.put("p");
+                    cset.put("q");
+                });
+            }
+
+            // moment 3
+            {
+                var history = new WriteArrayList(source.rootCursor());
+                history.appendContext(history.getSlot(-1), (cursor) -> {
+                    var moment = new WriteHashMap(cursor);
+                    moment.put("key1", new Database.Bytes("final_value"));
+                });
+            }
+
+            var sourceSize = sourceCore.length();
+
+            // compact
+            var compacted = source.compact(targetCore);
+
+            var targetSize = targetCore.length();
+
+            // target should be smaller than source (3 moments vs 1)
+            assertTrue(targetSize < sourceSize);
+
+            // target should have exactly 1 moment
+            var history = new ReadArrayList(compacted.rootCursor());
+            assertEquals(1, history.count());
+
+            // verify all data from latest moment is correct
+            var momentCursor = history.getCursor(0);
+            var moment = new ReadHashMap(momentCursor);
+
+            // key1 should have the final value
+            assertEquals("final_value", new String(moment.getCursor("key1").readBytes(MAX_READ_BYTES)));
+
+            // key2 from moment 2
+            assertEquals(200, moment.getCursor("key2").readUint());
+
+            // key3 - int
+            assertEquals(-42, moment.getCursor("key3").readInt());
+
+            // key4 - float
+            assertEquals(3.14, moment.getCursor("key4").readFloat());
+
+            // short bytes
+            assertEquals("hi", new String(moment.getCursor("short").readBytes(MAX_READ_BYTES)));
+
+            // tagged bytes
+            var taggedObj = moment.getCursor("tagged").readBytesObject(MAX_READ_BYTES);
+            assertEquals("this is a long tagged string!!", new String(taggedObj.value()));
+            assertEquals("bi", new String(taggedObj.formatTag()));
+
+            // ArrayList
+            var fruitsCursor = moment.getCursor("fruits");
+            var fruits = new ReadArrayList(fruitsCursor);
+            assertEquals(3, fruits.count());
+            assertEquals("apple", new String(fruits.getCursor(0).readBytes(MAX_READ_BYTES)));
+            assertEquals("cherry", new String(fruits.getCursor(2).readBytes(MAX_READ_BYTES)));
+
+            // LinkedArrayList
+            var todosCursor = moment.getCursor("todos");
+            var todos = new ReadLinkedArrayList(todosCursor);
+            assertEquals(3, todos.count());
+            assertEquals("task1", new String(todos.getCursor(0).readBytes(MAX_READ_BYTES)));
+            assertEquals("task3", new String(todos.getCursor(2).readBytes(MAX_READ_BYTES)));
+
+            // CountedHashMap
+            var countedCursor = moment.getCursor("counted");
+            var counted = new ReadCountedHashMap(countedCursor);
+            assertEquals(2, counted.count());
+            assertEquals(1, counted.getCursor("a").readUint());
+            assertEquals(2, counted.getCursor("b").readUint());
+
+            // HashSet
+            var setCursor = moment.getCursor("myset");
+            var set = new ReadHashSet(setCursor);
+            assertEquals("x", new String(set.getCursor("x").readBytes(MAX_READ_BYTES)));
+
+            // CountedHashSet
+            var csetCursor = moment.getCursor("mycset");
+            var cset = new ReadCountedHashSet(csetCursor);
+            assertEquals(2, cset.count());
+            assertEquals("p", new String(cset.getCursor("p").readBytes(MAX_READ_BYTES)));
+        }
+
+        // structural sharing (most data shared, only 1 key changes per moment)
+        {
+            sourceCore.setLength(0);
+            targetCore.setLength(0);
+            var source = new Database(sourceCore, hasher);
+
+            // moment 1: create many keys
+            {
+                var history = new WriteArrayList(source.rootCursor());
+                history.appendContext(history.getSlot(-1), (cursor) -> {
+                    var moment = new WriteHashMap(cursor);
+                    for (int i = 0; i < 20; i++) {
+                        moment.put("shared_key_" + i, new Database.Uint(i));
+                    }
+                });
+            }
+
+            // moments 2-5: change only one key each time
+            for (int round = 0; round < 4; round++) {
+                var history = new WriteArrayList(source.rootCursor());
+                final int r = round;
+                history.appendContext(history.getSlot(-1), (cursor) -> {
+                    var moment = new WriteHashMap(cursor);
+                    moment.put("changing_key", new Database.Uint(r + 100));
+                });
+            }
+
+            var compacted = source.compact(targetCore);
+
+            var history = new ReadArrayList(compacted.rootCursor());
+            assertEquals(1, history.count());
+
+            var momentCursor = history.getCursor(0);
+            var moment = new ReadHashMap(momentCursor);
+
+            // verify shared keys are intact
+            for (int i = 0; i < 20; i++) {
+                assertEquals(i, moment.getCursor("shared_key_" + i).readUint());
+            }
+
+            // verify changing key has latest value
+            assertEquals(103, moment.getCursor("changing_key").readUint());
+        }
+
+        // re-open after compact and compact-then-continue-writing
+        // (only meaningful for file modes)
+        if (sourceFile != null && targetFile != null) {
+            // re-open after compact
+            {
+                sourceCore.setLength(0);
+                targetCore.setLength(0);
+                var source = new Database(sourceCore, hasher);
+
+                // write some data
+                {
+                    var history = new WriteArrayList(source.rootCursor());
+                    history.appendContext(history.getSlot(-1), (cursor) -> {
+                        var moment = new WriteHashMap(cursor);
+                        moment.put("persist", new Database.Bytes("persistent_value"));
+                        moment.put("number", new Database.Uint(999));
+                    });
+                }
+
+                // compact
+                source.compact(targetCore);
+
+                // re-open the target
+                targetCore.seek(0);
+                var reopened = new Database(targetCore, hasher);
+
+                var history = new ReadArrayList(reopened.rootCursor());
+                assertEquals(1, history.count());
+
+                var momentCursor = history.getCursor(0);
+                var moment = new ReadHashMap(momentCursor);
+                assertEquals("persistent_value", new String(moment.getCursor("persist").readBytes(MAX_READ_BYTES)));
+                assertEquals(999, moment.getCursor("number").readUint());
+            }
+
+            // compact then continue writing
+            {
+                sourceCore.setLength(0);
+                targetCore.setLength(0);
+                var source = new Database(sourceCore, hasher);
+
+                // write initial data
+                {
+                    var history = new WriteArrayList(source.rootCursor());
+                    history.appendContext(history.getSlot(-1), (cursor) -> {
+                        var moment = new WriteHashMap(cursor);
+                        moment.put("original", new Database.Bytes("original_data"));
+                    });
+                }
+
+                // compact
+                var compacted = source.compact(targetCore);
+
+                // add new moment to compacted DB
+                {
+                    var history = new WriteArrayList(compacted.rootCursor());
+                    history.appendContext(history.getSlot(-1), (cursor) -> {
+                        var moment = new WriteHashMap(cursor);
+                        moment.put("new_key", new Database.Bytes("new_data"));
+                    });
+                }
+
+                // verify both old and new data
+                var history = new ReadArrayList(compacted.rootCursor());
+                assertEquals(2, history.count());
+
+                // moment 0 (compacted original)
+                var m0Cursor = history.getCursor(0);
+                var m0 = new ReadHashMap(m0Cursor);
+                assertEquals("original_data", new String(m0.getCursor("original").readBytes(MAX_READ_BYTES)));
+
+                // moment 1 (new data added after compact)
+                var m1Cursor = history.getCursor(1);
+                var m1 = new ReadHashMap(m1Cursor);
+                assertEquals("new_data", new String(m1.getCursor("new_key").readBytes(MAX_READ_BYTES)));
+
+                // original data should still be in moment 1 (inherited)
+                assertEquals("original_data", new String(m1.getCursor("original").readBytes(MAX_READ_BYTES)));
+            }
         }
     }
 }
