@@ -409,15 +409,14 @@ assertEquals("SHA-1", hasher.md().getAlgorithm());
 Normally, an immutable database grows forever, because old data is never deleted. To reclaim disk space and clear the history, xitdb supports compaction. This involves completely rebuilding the database file to only contain the data accessible from the latest copy (i.e., "moment") of the database.
 
 ```java
-// create the file and core for the new database
-var compactFile = new RandomAccessBufferedFile(new File("compact.db"), "rw");
-var compactCore = new CoreBufferedFile(compactFile);
+try (var compactFile = new RandomAccessBufferedFile(new File("compact.db"), "rw")) {
+    var compactCore = new CoreBufferedFile(compactFile);
+    var compactDb = db.compact(compactCore);
 
-var compactDb = db.compact(compactCore);
-
-// read from the new compacted db
-var history = new ReadArrayList(compactDb.rootCursor());
-assertEquals(1, history.count());
+    // read from the new compacted db
+    var history = new ReadArrayList(compactDb.rootCursor());
+    assertEquals(1, history.count());
+}
 ```
 
 ## Thread Safety
