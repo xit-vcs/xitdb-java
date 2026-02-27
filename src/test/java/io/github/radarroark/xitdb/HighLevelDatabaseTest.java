@@ -923,6 +923,20 @@ class HighLevelDatabaseTest {
                 testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
             }
         }
+
+        // buffered file to memory
+        {
+            var sourceFile = File.createTempFile("compact_source", ".db");
+            sourceFile.deleteOnExit();
+
+            try (var sourceRaf = new RandomAccessBufferedFile(sourceFile, "rw");
+                 var targetRam = new RandomAccessMemory()) {
+                var sourceCore = new CoreBufferedFile(sourceRaf);
+                var targetCore = new CoreMemory(targetRam);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testCompaction(sourceCore, targetCore, hasher, sourceFile, null);
+            }
+        }
     }
 
     void testCompaction(Core sourceCore, Core targetCore, Hasher hasher, File sourceFile, File targetFile) throws Exception {
