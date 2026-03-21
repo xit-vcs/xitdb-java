@@ -14,7 +14,8 @@ public enum Tag {
     FLOAT,
     HASH_SET,
     COUNTED_HASH_MAP,
-    COUNTED_HASH_SET;
+    COUNTED_HASH_SET,
+    SORTED_HASH_MAP;
 
     public static Tag valueOf(int n) {
         return Tag.values()[n];

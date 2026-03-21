@@ -360,7 +360,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         public Iterator(ReadCursor cursor) throws IOException {
             this.cursor = cursor;
             switch (cursor.slotPtr.slot().tag()) {
-                case NONE -> {
+                case NONE, SORTED_HASH_MAP -> {
                     this.size = 0;
                     this.index = 0;
                     this.stack = new Stack<Level>();
