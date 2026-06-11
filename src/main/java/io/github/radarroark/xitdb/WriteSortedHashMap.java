@@ -5,7 +5,9 @@ import java.util.Arrays;
 
 /**
  * A writable sorted hash map implemented as a B-tree ordered by sort key bytes.
- * Supports O(log n) insert and lookup. Delete rebuilds the tree (O(n) for now).
+ * Insert, lookup, and delete are all O(log n); delete rebalances with sibling
+ * borrows/merges on the way down, appending only the rewritten path (plus at
+ * most one sibling per level) to the file.
  */
 public class WriteSortedHashMap extends ReadSortedHashMap {
     private long rootStart;
@@ -354,111 +356,237 @@ public class WriteSortedHashMap extends ReadSortedHashMap {
         return new WriteCursor(new SlotPointer(keySlotPos, Slot.fromBytes(slotBytes)), cursor.db);
     }
 
+    // --- Delete (standard top-down B-tree deletion, O(log n)) ---
+    //
+    // Every modified node is appended via writeNode (copy-on-write), so only
+    // the root-to-leaf path plus at most one sibling per level is rewritten.
+    // Nodes from earlier transactions are never touched in place.
+
+    static final int MIN_KEYS = MAX_KEYS / 2;
+
     /**
-     * Remove by sort key. Rebuilds tree without the entry (O(n)).
+     * Remove by sort key. O(log n): rebalances with sibling borrows/merges
+     * on the way down so no node ever underflows.
      */
     public boolean removeBySortKey(byte[] sortKey) throws Exception {
         long kvPos = findKVPairPos(sortKey);
         if (kvPos < 0) return false;
 
         long currentCount = count();
-        var allSortKeys = new java.util.ArrayList<byte[]>();
-        var allKvPositions = new java.util.ArrayList<Long>();
-        collectForRebuild(readRootNodePos(), sortKey, allSortKeys, allKvPositions);
-
-        // Build new tree from collected entries
-        if (allSortKeys.isEmpty()) {
-            writeRootNodePos(0);
-        } else {
-            long newRoot = buildLeafFromEntries(allSortKeys, allKvPositions, 0, allSortKeys.size() - 1);
-            writeRootNodePos(newRoot);
+        long newRootPos = deleteFrom(readRootNodePos(), sortKey);
+        var newRoot = readNode(newRootPos);
+        if (newRoot.nEntries == 0) {
+            // root emptied: a leaf root means the map is now empty
+            newRootPos = newRoot.isLeaf ? 0 : newRoot.childPositions[0];
         }
+        writeRootNodePos(newRootPos);
         writeCount(currentCount - 1);
         return true;
     }
 
-    private void collectForRebuild(long nodePos, byte[] excludeSortKey,
-                                    java.util.List<byte[]> sortKeys, java.util.List<Long> kvPositions) throws IOException {
-        var node = readNode(nodePos);
-        if (node.isLeaf) {
-            for (int i = 0; i < node.nEntries; i++) {
-                if (!Arrays.equals(node.sortKeys[i], excludeSortKey)) {
-                    sortKeys.add(node.sortKeys[i]);
-                    kvPositions.add(node.kvPairPositions[i]);
-                }
-            }
-        } else {
-            for (int i = 0; i < node.nEntries; i++) {
-                collectForRebuild(node.childPositions[i], excludeSortKey, sortKeys, kvPositions);
-                if (!Arrays.equals(node.sortKeys[i], excludeSortKey)) {
-                    sortKeys.add(node.sortKeys[i]);
-                    kvPositions.add(node.kvPairPositions[i]);
-                }
-            }
-            collectForRebuild(node.childPositions[node.nEntries], excludeSortKey, sortKeys, kvPositions);
+    private record Entry(byte[] sortKey, long kvPos) {}
+
+    private Entry maxEntry(long nodePos) throws IOException {
+        while (true) {
+            var n = readNode(nodePos);
+            if (n.isLeaf) return new Entry(n.sortKeys[n.nEntries - 1], n.kvPairPositions[n.nEntries - 1]);
+            nodePos = n.childPositions[n.nEntries];
         }
     }
 
-    private long buildLeafFromEntries(java.util.List<byte[]> sortKeys, java.util.List<Long> kvPositions, int lo, int hi) throws IOException {
-        int n = hi - lo + 1;
-        if (n <= MAX_KEYS) {
-            var node = new BTreeNode();
-            node.isLeaf = true;
-            node.nEntries = n;
-            node.sortKeys = new byte[n][];
-            node.kvPairPositions = new long[n];
-            for (int i = 0; i < n; i++) {
-                node.sortKeys[i] = sortKeys.get(lo + i);
-                node.kvPairPositions[i] = kvPositions.get(lo + i);
-            }
+    private Entry minEntry(long nodePos) throws IOException {
+        while (true) {
+            var n = readNode(nodePos);
+            if (n.isLeaf) return new Entry(n.sortKeys[0], n.kvPairPositions[0]);
+            nodePos = n.childPositions[0];
+        }
+    }
+
+    /**
+     * Deletes `key` from the subtree at nodePos and returns the position of
+     * the rewritten subtree root. The caller guarantees the key exists and
+     * that this node has more than MIN_KEYS entries (or is the root).
+     */
+    private long deleteFrom(long nodePos, byte[] key) throws IOException {
+        var node = readNode(nodePos);
+        int idx = node.search(key);
+
+        if (node.isLeaf) {
+            if (idx < 0) return nodePos; // defensive; existence is pre-checked
+            removeEntry(node, idx);
             return writeNode(node);
         }
 
-        // Split into chunks and build internal nodes
-        int numChunks = (n + MAX_KEYS - 1) / MAX_KEYS;
-        if (numChunks < 2) numChunks = 2;
-        var leafPositions = new long[numChunks];
-        int entriesPerChunk = n / numChunks;
-        int remainder = n % numChunks;
-        int pos = lo;
-        var chunkLastSortKeys = new byte[numChunks][];
-        var chunkLastKvPositions = new long[numChunks];
-        for (int c = 0; c < numChunks; c++) {
-            int size = entriesPerChunk + (c < remainder ? 1 : 0);
-            var node = new BTreeNode();
-            node.isLeaf = true;
-            node.nEntries = size;
-            node.sortKeys = new byte[size][];
-            node.kvPairPositions = new long[size];
-            for (int i = 0; i < size; i++) {
-                node.sortKeys[i] = sortKeys.get(pos + i);
-                node.kvPairPositions[i] = kvPositions.get(pos + i);
+        if (idx >= 0) {
+            // key sits in this internal node: replace it with its in-order
+            // neighbor from whichever adjacent child can spare an entry
+            var left = readNode(node.childPositions[idx]);
+            if (left.nEntries > MIN_KEYS) {
+                var pred = maxEntry(node.childPositions[idx]);
+                node.sortKeys[idx] = pred.sortKey();
+                node.kvPairPositions[idx] = pred.kvPos();
+                node.childPositions[idx] = deleteFrom(node.childPositions[idx], pred.sortKey());
+                return writeNode(node);
             }
-            chunkLastSortKeys[c] = node.sortKeys[size - 1];
-            chunkLastKvPositions[c] = node.kvPairPositions[size - 1];
-            leafPositions[c] = writeNode(node);
-            pos += size;
+            var right = readNode(node.childPositions[idx + 1]);
+            if (right.nEntries > MIN_KEYS) {
+                var succ = minEntry(node.childPositions[idx + 1]);
+                node.sortKeys[idx] = succ.sortKey();
+                node.kvPairPositions[idx] = succ.kvPos();
+                node.childPositions[idx + 1] = deleteFrom(node.childPositions[idx + 1], succ.sortKey());
+                return writeNode(node);
+            }
+            // both neighbors minimal: merge them around the key, then delete
+            // the key from the merged child
+            long mergedPos = mergeChildren(node, idx);
+            if (node.nEntries == 0) {
+                return deleteFrom(mergedPos, key); // root collapse
+            }
+            node.childPositions[idx] = deleteFrom(mergedPos, key);
+            return writeNode(node);
         }
 
-        // Build internal node pulling last entry from each chunk as separator
-        int numSeps = numChunks - 1;
-        var internal = new BTreeNode();
-        internal.isLeaf = false;
-        internal.nEntries = numSeps;
-        internal.sortKeys = new byte[numSeps][];
-        internal.kvPairPositions = new long[numSeps];
-        internal.childPositions = new long[numChunks];
-        for (int i = 0; i < numSeps; i++) {
-            internal.sortKeys[i] = chunkLastSortKeys[i];
-            internal.kvPairPositions[i] = chunkLastKvPositions[i];
-            // Shrink this leaf by removing last entry
-            var leaf = readNode(leafPositions[i]);
-            leaf.nEntries--;
-            leafPositions[i] = writeNode(leaf);
-            internal.childPositions[i] = leafPositions[i];
+        // key is below: make sure the target child can lose an entry, then descend
+        int ip = -(idx) - 1;
+        int ci = fixChild(node, ip);
+        if (node.nEntries == 0) {
+            return deleteFrom(node.childPositions[ci], key); // root collapse via merge
         }
-        internal.childPositions[numChunks - 1] = leafPositions[numChunks - 1];
-        return writeNode(internal);
+        node.childPositions[ci] = deleteFrom(node.childPositions[ci], key);
+        return writeNode(node);
+    }
+
+    /**
+     * Ensures the child at index i has more than MIN_KEYS entries, borrowing
+     * from a sibling or merging with one. Returns the index of the child to
+     * descend into (i-1 if the child was merged into its left sibling).
+     */
+    private int fixChild(BTreeNode parent, int i) throws IOException {
+        var child = readNode(parent.childPositions[i]);
+        if (child.nEntries > MIN_KEYS) return i;
+
+        if (i > 0) {
+            var left = readNode(parent.childPositions[i - 1]);
+            if (left.nEntries > MIN_KEYS) {
+                // rotate right: separator moves down to child's front,
+                // left sibling's last entry moves up to the separator slot
+                insertEntry(child, 0, parent.sortKeys[i - 1], parent.kvPairPositions[i - 1]);
+                if (!child.isLeaf) {
+                    child.childPositions = insertAt(child.childPositions, 0, left.childPositions[left.nEntries]);
+                }
+                parent.sortKeys[i - 1] = left.sortKeys[left.nEntries - 1];
+                parent.kvPairPositions[i - 1] = left.kvPairPositions[left.nEntries - 1];
+                if (!left.isLeaf) {
+                    left.childPositions = dropAt(left.childPositions, left.nEntries);
+                }
+                removeEntry(left, left.nEntries - 1);
+                parent.childPositions[i - 1] = writeNode(left);
+                parent.childPositions[i] = writeNode(child);
+                return i;
+            }
+        }
+        if (i < parent.nEntries) {
+            var right = readNode(parent.childPositions[i + 1]);
+            if (right.nEntries > MIN_KEYS) {
+                // rotate left: separator moves down to child's end,
+                // right sibling's first entry moves up to the separator slot
+                insertEntry(child, child.nEntries, parent.sortKeys[i], parent.kvPairPositions[i]);
+                if (!child.isLeaf) {
+                    child.childPositions = insertAt(child.childPositions, child.nEntries, right.childPositions[0]);
+                }
+                parent.sortKeys[i] = right.sortKeys[0];
+                parent.kvPairPositions[i] = right.kvPairPositions[0];
+                removeEntry(right, 0);
+                if (!right.isLeaf) {
+                    right.childPositions = dropAt(right.childPositions, 0);
+                }
+                parent.childPositions[i] = writeNode(child);
+                parent.childPositions[i + 1] = writeNode(right);
+                return i;
+            }
+        }
+        // both siblings minimal: merge (two MIN_KEYS nodes + separator = MAX_KEYS)
+        if (i > 0) {
+            mergeChildren(parent, i - 1);
+            return i - 1;
+        }
+        mergeChildren(parent, 0);
+        return 0;
+    }
+
+    /**
+     * Merges parent's children at sepIdx and sepIdx+1 with the separator entry
+     * between them. Removes the separator and the right child from the parent
+     * (in memory) and points parent.childPositions[sepIdx] at the merged node.
+     */
+    private long mergeChildren(BTreeNode parent, int sepIdx) throws IOException {
+        var left = readNode(parent.childPositions[sepIdx]);
+        var right = readNode(parent.childPositions[sepIdx + 1]);
+        var merged = new BTreeNode();
+        merged.isLeaf = left.isLeaf;
+        merged.nEntries = left.nEntries + 1 + right.nEntries;
+        merged.sortKeys = new byte[merged.nEntries][];
+        merged.kvPairPositions = new long[merged.nEntries];
+        System.arraycopy(left.sortKeys, 0, merged.sortKeys, 0, left.nEntries);
+        System.arraycopy(left.kvPairPositions, 0, merged.kvPairPositions, 0, left.nEntries);
+        merged.sortKeys[left.nEntries] = parent.sortKeys[sepIdx];
+        merged.kvPairPositions[left.nEntries] = parent.kvPairPositions[sepIdx];
+        System.arraycopy(right.sortKeys, 0, merged.sortKeys, left.nEntries + 1, right.nEntries);
+        System.arraycopy(right.kvPairPositions, 0, merged.kvPairPositions, left.nEntries + 1, right.nEntries);
+        if (!left.isLeaf) {
+            merged.childPositions = new long[merged.nEntries + 1];
+            System.arraycopy(left.childPositions, 0, merged.childPositions, 0, left.nEntries + 1);
+            System.arraycopy(right.childPositions, 0, merged.childPositions, left.nEntries + 1, right.nEntries + 1);
+        }
+        long mergedPos = writeNode(merged);
+        removeEntry(parent, sepIdx);
+        parent.childPositions = dropAt(parent.childPositions, sepIdx + 1);
+        parent.childPositions[sepIdx] = mergedPos;
+        return mergedPos;
+    }
+
+    // --- In-memory node entry manipulation ---
+
+    private static void removeEntry(BTreeNode n, int i) {
+        n.sortKeys = dropAt(n.sortKeys, i);
+        n.kvPairPositions = dropAt(n.kvPairPositions, i);
+        n.nEntries--;
+    }
+
+    private static void insertEntry(BTreeNode n, int i, byte[] key, long kvPos) {
+        n.sortKeys = insertAt(n.sortKeys, i, key);
+        n.kvPairPositions = insertAt(n.kvPairPositions, i, kvPos);
+        n.nEntries++;
+    }
+
+    private static byte[][] insertAt(byte[][] a, int i, byte[] v) {
+        var r = new byte[a.length + 1][];
+        System.arraycopy(a, 0, r, 0, i);
+        r[i] = v;
+        System.arraycopy(a, i, r, i + 1, a.length - i);
+        return r;
+    }
+
+    private static long[] insertAt(long[] a, int i, long v) {
+        var r = new long[a.length + 1];
+        System.arraycopy(a, 0, r, 0, i);
+        r[i] = v;
+        System.arraycopy(a, i, r, i + 1, a.length - i);
+        return r;
+    }
+
+    private static byte[][] dropAt(byte[][] a, int i) {
+        var r = new byte[a.length - 1][];
+        System.arraycopy(a, 0, r, 0, i);
+        System.arraycopy(a, i + 1, r, i, a.length - i - 1);
+        return r;
+    }
+
+    private static long[] dropAt(long[] a, int i) {
+        var r = new long[a.length - 1];
+        System.arraycopy(a, 0, r, 0, i);
+        System.arraycopy(a, i + 1, r, i, a.length - i - 1);
+        return r;
     }
 
     // --- Convenience overrides for hash-based API ---
