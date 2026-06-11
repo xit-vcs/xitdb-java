@@ -364,25 +364,6 @@ public class WriteSortedHashMap extends ReadSortedHashMap {
         long currentCount = count();
         var allSortKeys = new java.util.ArrayList<byte[]>();
         var allKvPositions = new java.util.ArrayList<Long>();
-
-        // Collect all entries except the one to remove, in order
-        var iter = iterator();
-        while (iter.hasNext()) {
-            var entryCursor = iter.next();
-            var kv = entryCursor.readKeyValuePair();
-            // Read this entry's KV pair position
-            long entryKvPos = entryCursor.slotPtr.slot().value();
-            if (entryKvPos != kvPos) {
-                // We need the sort key for this entry — read it from the B-tree
-                // Actually we already have the entries in order from the iterator.
-                // We need to find the sort key. Let's just collect from nodes.
-                allKvPositions.add(entryKvPos);
-            }
-        }
-
-        // Rebuild: collect sort keys by reading the tree in order
-        allSortKeys.clear();
-        allKvPositions.clear();
         collectForRebuild(readRootNodePos(), sortKey, allSortKeys, allKvPositions);
 
         // Build new tree from collected entries

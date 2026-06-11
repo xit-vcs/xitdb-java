@@ -204,53 +204,129 @@ public class ReadSortedHashMap extends ReadHashMap {
 
     @Override
     public ReadCursor.Iterator iterator() {
+        return iterator(null, true);
+    }
+
+    /**
+     * Streaming in-order iterator over KV_PAIR cursors.
+     *
+     * @param startSortKey if non-null, start at the first entry whose sort key is
+     *                     >= startSortKey (ascending) or <= startSortKey (descending);
+     *                     if null, start at the first/last entry.
+     * @param ascending    iteration direction.
+     */
+    public ReadCursor.Iterator iterator(byte[] startSortKey, boolean ascending) {
         try {
-            return new BTreeIterator(this);
+            return new BTreeIterator(this, startSortKey, ascending);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
+    /**
+     * Streams entries with a stack of B-tree node frames, so memory use is
+     * O(tree height) regardless of map size. Each frame's idx points at the
+     * next entry of that node to emit (entries of internal nodes are emitted
+     * between their adjacent child subtrees, per in-order traversal).
+     */
     public static class BTreeIterator extends ReadCursor.Iterator {
-        private ReadSortedHashMap map;
-        private java.util.List<Long> kvPositions;
-        private int index;
+        private final ReadSortedHashMap map;
+        private final boolean ascending;
+        private final java.util.ArrayDeque<Frame> stack = new java.util.ArrayDeque<>();
 
-        public BTreeIterator(ReadSortedHashMap map) throws IOException {
-            super(map.cursor);
-            this.map = map;
-            this.kvPositions = new java.util.ArrayList<>();
-            this.index = 0;
-            long rootPos = map.readRootNodePos();
-            if (rootPos > 0) {
-                collectInOrder(rootPos);
+        private static class Frame {
+            final BTreeNode node;
+            int idx;
+
+            Frame(BTreeNode node, int idx) {
+                this.node = node;
+                this.idx = idx;
             }
         }
 
-        private void collectInOrder(long nodePos) throws IOException {
-            var node = map.readNode(nodePos);
-            if (node.isLeaf) {
-                for (int i = 0; i < node.nEntries; i++) {
-                    kvPositions.add(node.kvPairPositions[i]);
+        public BTreeIterator(ReadSortedHashMap map) throws IOException {
+            this(map, null, true);
+        }
+
+        public BTreeIterator(ReadSortedHashMap map, byte[] startSortKey, boolean ascending) throws IOException {
+            super(map.cursor);
+            this.map = map;
+            this.ascending = ascending;
+            long rootPos = map.readRootNodePos();
+            if (rootPos > 0) {
+                if (startSortKey == null) {
+                    pushEdgePath(rootPos);
+                } else {
+                    seek(rootPos, startSortKey);
                 }
-            } else {
-                for (int i = 0; i < node.nEntries; i++) {
-                    collectInOrder(node.childPositions[i]);
-                    kvPositions.add(node.kvPairPositions[i]);
+                popExhausted();
+            }
+        }
+
+        /** Descend along the leftmost (ascending) or rightmost (descending) path. */
+        private void pushEdgePath(long nodePos) throws IOException {
+            while (true) {
+                var node = map.readNode(nodePos);
+                stack.push(new Frame(node, ascending ? 0 : node.nEntries - 1));
+                if (node.isLeaf) return;
+                nodePos = ascending ? node.childPositions[0] : node.childPositions[node.nEntries];
+            }
+        }
+
+        /**
+         * Position the stack so the next emitted entry is the first >= startSortKey
+         * (ascending) or the last <= startSortKey (descending).
+         */
+        private void seek(long nodePos, byte[] key) throws IOException {
+            while (true) {
+                var node = map.readNode(nodePos);
+                int idx = node.search(key);
+                if (idx >= 0) {
+                    // exact match: emit it first in either direction
+                    stack.push(new Frame(node, idx));
+                    return;
                 }
-                collectInOrder(node.childPositions[node.nEntries]);
+                int insertionPoint = -(idx) - 1;
+                // entries[insertionPoint-1] < key < entries[insertionPoint];
+                // child[insertionPoint] holds the keys strictly between them
+                stack.push(new Frame(node, ascending ? insertionPoint : insertionPoint - 1));
+                if (node.isLeaf) return;
+                nodePos = node.childPositions[insertionPoint];
+            }
+        }
+
+        /** Drop finished frames so the top frame (if any) has a valid next entry. */
+        private void popExhausted() {
+            while (!stack.isEmpty()) {
+                var f = stack.peek();
+                boolean exhausted = ascending ? f.idx >= f.node.nEntries : f.idx < 0;
+                if (!exhausted) return;
+                stack.pop();
             }
         }
 
         @Override
         public boolean hasNext() {
-            return index < kvPositions.size();
+            return !stack.isEmpty();
         }
 
         @Override
         public ReadCursor next() {
-            if (!hasNext()) return null;
-            long kvPos = kvPositions.get(index++);
+            if (stack.isEmpty()) return null;
+            var f = stack.peek();
+            long kvPos = f.node.kvPairPositions[f.idx];
+            try {
+                if (ascending) {
+                    f.idx++;
+                    if (!f.node.isLeaf) pushEdgePath(f.node.childPositions[f.idx]);
+                } else {
+                    f.idx--;
+                    if (!f.node.isLeaf) pushEdgePath(f.node.childPositions[f.idx + 1]);
+                }
+                popExhausted();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
             return new ReadCursor(
                 new SlotPointer(kvPos, new Slot(kvPos, Tag.KV_PAIR)),
                 map.cursor.db);
