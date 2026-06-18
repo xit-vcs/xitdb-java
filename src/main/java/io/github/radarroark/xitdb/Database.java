@@ -736,15 +736,14 @@ public class Database {
             var result = db.btreeInsert(header.rootPtr(), header.size());
             var newRootPtr = db.btreeGrowRoot(result);
 
-            // fill in the value via the rest of the path
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
-
-            // update header
+            // update the header before filling in the value, so that a failure in
+            // the rest of the path leaves the tree and header consistent
             var writer = db.core.writer();
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, header.size() + 1).toBytes());
 
-            return finalSlotPtr;
+            // fill in the value via the rest of the path
+            return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
         }
     }
 
@@ -770,14 +769,14 @@ public class Database {
             var afterOffset = db.btreeSplit(header.rootPtr(), this.offset());
             var sliced = db.btreeSplit(afterOffset.right(), this.size());
             var newRootPtr = sliced.left();
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
-            // update header
+            // update the header before recursing into the rest of the path, so that
+            // a failure there leaves the tree and header consistent
             var writer = db.core.writer();
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, this.size()).toBytes());
 
-            return finalSlotPtr;
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
         }
     }
 
@@ -806,14 +805,14 @@ public class Database {
             // is still referenced elsewhere.
             db.txStart = db.core.length();
             var newRootPtr = db.btreeJoin(headerA.rootPtr(), headerB.rootPtr());
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
-            // update header
+            // update the header before recursing into the rest of the path, so that
+            // a failure there leaves the tree and header consistent
             var writer = db.core.writer();
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, headerA.size() + headerB.size()).toBytes());
 
-            return finalSlotPtr;
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
         }
     }
 
@@ -839,14 +838,13 @@ public class Database {
             var result = db.btreeInsert(header.rootPtr(), rank);
             var newRootPtr = db.btreeGrowRoot(result);
 
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
-
-            // update header
+            // update the header before filling in the value, so that a failure in
+            // the rest of the path leaves the tree and header consistent
             var writer = db.core.writer();
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, header.size() + 1).toBytes());
 
-            return finalSlotPtr;
+            return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
         }
     }
 
@@ -873,14 +871,14 @@ public class Database {
             var before = db.btreeSplit(header.rootPtr(), rank);
             var after = db.btreeSplit(before.right(), 1);
             var newRootPtr = db.btreeJoin(before.left(), after.right());
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
-            // update header
+            // update the header before recursing into the rest of the path, so that
+            // a failure there leaves the tree and header consistent
             var writer = db.core.writer();
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, header.size() - 1).toBytes());
 
-            return finalSlotPtr;
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
         }
     }
 
@@ -1128,15 +1126,17 @@ public class Database {
             } else {
                 var result = db.sortedPut(header.rootPtr(), key);
                 var newRootPtr = db.sortedGrowRoot(result);
-                var kvPos = result.valuePosition() - db.header.hashSize() - Slot.length;
-                var targetSlot = db.sortedTargetSlot(kvPos, this.target());
-                var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
 
+                // update the header before filling in the value, so that a failure in
+                // the rest of the path leaves the tree and header consistent (the entry
+                // exists with an empty value) rather than inserted-but-uncounted
                 var writer = db.core.writer();
                 db.core.seek(headerPtr);
                 writer.write(new BTreeHeader(newRootPtr, header.size() + (result.added() ? 1 : 0)).toBytes());
 
-                return finalSlotPtr;
+                var kvPos = result.valuePosition() - db.header.hashSize() - Slot.length;
+                var targetSlot = db.sortedTargetSlot(kvPos, this.target());
+                return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
             }
         }
     }

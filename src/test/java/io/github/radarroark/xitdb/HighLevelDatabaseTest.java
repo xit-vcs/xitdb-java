@@ -1412,6 +1412,20 @@ class HighLevelDatabaseTest {
                         new Database.WriteData(new Database.Bytes("x"))
                     });
                 });
+
+                // a write that fails after the key is inserted (a missing key written
+                // through the non-writeable key slot) must still leave the count
+                // consistent with the tree, not inserted-but-uncounted
+                var countBeforeFailedWrite = map.count();
+                assertThrows(Database.CursorNotWriteableException.class, () -> {
+                    ((WriteCursor)map.cursor).writePath(new Database.PathPart[]{
+                        new Database.SortedMapGet(new Database.SortedMapGetKey("missing-key".getBytes())),
+                        new Database.WriteData(new Database.Bytes("x"))
+                    });
+                });
+                assertEquals(countBeforeFailedWrite + 1, map.count());
+                assertTrue(map.getKeyValuePair("missing-key") != null);
+                map.remove("missing-key"); // restore the map for the assertions below
             })
         });
 
