@@ -208,9 +208,9 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             }
             case LINKED_ARRAY_LIST -> {
                 this.db.core.seek(this.slotPtr.slot().value());
-                var headerBytes = new byte[Database.LinkedArrayListHeader.length];
+                var headerBytes = new byte[Database.BTreeHeader.length];
                 reader.readFully(headerBytes);
-                var header = Database.LinkedArrayListHeader.fromBytes(headerBytes);
+                var header = Database.BTreeHeader.fromBytes(headerBytes);
                 return header.size();
             }
             case BYTES -> {
@@ -374,28 +374,30 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                     var header = Database.ArrayListHeader.fromBytes(headerBytes);
                     this.size = cursor.count();
                     this.index = 0;
-                    this.stack = initStack(cursor, header.ptr(), Database.INDEX_BLOCK_SIZE);
+                    this.stack = initStack(cursor, header.ptr());
                 }
                 case LINKED_ARRAY_LIST -> {
+                    // backed by a b-tree: read the header, then walk from the root
+                    // node's value/child slots (skipping its kind+num header)
                     var position = cursor.slotPtr.slot().value();
                     cursor.db.core.seek(position);
                     var reader = cursor.db.core.reader();
-                    var headerBytes = new byte[Database.LinkedArrayListHeader.length];
+                    var headerBytes = new byte[Database.BTreeHeader.length];
                     reader.readFully(headerBytes);
-                    var header = Database.LinkedArrayListHeader.fromBytes(headerBytes);
+                    var header = Database.BTreeHeader.fromBytes(headerBytes);
                     this.size = cursor.count();
                     this.index = 0;
-                    this.stack = initStack(cursor, header.ptr(), Database.LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE);
+                    this.stack = initStack(cursor, header.rootPtr() + Database.BTREE_NODE_HEADER_SIZE);
                 }
                 case HASH_MAP, HASH_SET -> {
                     this.size = 0;
                     this.index = 0;
-                    this.stack = initStack(cursor, cursor.slotPtr.slot().value(), Database.INDEX_BLOCK_SIZE);
+                    this.stack = initStack(cursor, cursor.slotPtr.slot().value());
                 }
                 case COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
                     this.size = 0;
                     this.index = 0;
-                    this.stack = initStack(cursor, cursor.slotPtr.slot().value() + 8, Database.INDEX_BLOCK_SIZE);
+                    this.stack = initStack(cursor, cursor.slotPtr.slot().value() + 8);
                 }
                 default -> throw new Database.UnexpectedTagException();
             }
@@ -413,7 +415,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                     // field and then read from that field when next() is called.
                     if (this.nextCursorMaybe == null) {
                         try {
-                            this.nextCursorMaybe = nextInternal(Database.INDEX_BLOCK_SIZE);
+                            this.nextCursorMaybe = nextInternal(0);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -434,12 +436,14 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                     case ARRAY_LIST -> {
                         if (!hasNext()) return null;
                         this.index += 1;
-                        return nextInternal(Database.INDEX_BLOCK_SIZE);
+                        return nextInternal(0);
                     }
                     case LINKED_ARRAY_LIST -> {
                         if (!hasNext()) return null;
                         this.index += 1;
-                        return nextInternal(Database.LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE);
+                        // b-tree nodes have a kind+num header before their slots,
+                        // so child pointers are offset by BTREE_NODE_HEADER_SIZE
+                        return nextInternal(Database.BTREE_NODE_HEADER_SIZE);
                     }
                     case HASH_MAP, HASH_SET, COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
                         if (this.nextCursorMaybe != null) {
@@ -447,7 +451,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                             this.nextCursorMaybe = null;
                             return nextCursor;
                         } else {
-                            return nextInternal(Database.INDEX_BLOCK_SIZE);
+                            return nextInternal(0);
                         }
                     }
                     default -> throw new Database.UnexpectedTagException();
@@ -457,30 +461,30 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             }
         }
 
-        private static Stack<Level> initStack(ReadCursor cursor, long position, int blockSize) throws IOException {
-            // find the block
+        // read a 16-slot index block (the iterable structures all use 9-byte slots
+        // in their index/node blocks)
+        private static Slot[] readSlotBlock(ReadCursor cursor, long position) throws IOException {
             cursor.db.core.seek(position);
-            // read the block
             var reader = cursor.db.core.reader();
-            var indexBlockBytes = new byte[blockSize];
+            var indexBlockBytes = new byte[Database.INDEX_BLOCK_SIZE];
             reader.readFully(indexBlockBytes);
-            // convert the block into slots
             var indexBlock = new Slot[Database.SLOT_COUNT];
             var buffer = ByteBuffer.wrap(indexBlockBytes);
             for (int i = 0; i < indexBlock.length; i++) {
                 var slotBytes = new byte[Slot.length];
                 buffer.get(slotBytes);
                 indexBlock[i] = Slot.fromBytes(slotBytes);
-                // linked array list has larger slots so we need to skip over the rest
-                buffer.position(buffer.position() + ((blockSize / Database.SLOT_COUNT) - Slot.length));
             }
-            // init the stack
+            return indexBlock;
+        }
+
+        private static Stack<Level> initStack(ReadCursor cursor, long position) throws IOException {
             var stack = new Stack<Level>();
-            stack.add(new Level(position, indexBlock, (byte)0));
+            stack.add(new Level(position, readSlotBlock(cursor, position), (byte)0));
             return stack;
         }
 
-        private ReadCursor nextInternal(int blockSize) throws IOException {
+        private ReadCursor nextInternal(long nodeOffset) throws IOException {
             while (!this.stack.empty()) {
                 var level = this.stack.peek();
                 if (level.index == level.block.length) {
@@ -492,25 +496,9 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 } else {
                     var nextSlot = level.block[level.index];
                     if (nextSlot.tag() == Tag.INDEX) {
-                        // find the block
-                        var nextPos = nextSlot.value();
-                        cursor.db.core.seek(nextPos);
-                        // read the block
-                        var reader = cursor.db.core.reader();
-                        var indexBlockBytes = new byte[blockSize];
-                        reader.readFully(indexBlockBytes);
-                        // convert the block into slots
-                        var indexBlock = new Slot[Database.SLOT_COUNT];
-                        var buffer = ByteBuffer.wrap(indexBlockBytes);
-                        for (int i = 0; i < indexBlock.length; i++) {
-                            var slotBytes = new byte[Slot.length];
-                            buffer.get(slotBytes);
-                            indexBlock[i] = Slot.fromBytes(slotBytes);
-                            // linked array list has larger slots so we need to skip over the rest
-                            buffer.position(buffer.position() + ((blockSize / Database.SLOT_COUNT) - Slot.length));
-                        }
-                        // append to the stack
-                        stack.add(new Level(nextPos, indexBlock, (byte)0));
+                        // nodeOffset skips a b-tree node's kind+num header
+                        var nextPos = nextSlot.value() + nodeOffset;
+                        stack.add(new Level(nextPos, readSlotBlock(this.cursor, nextPos), (byte)0));
                         continue;
                     } else {
                         this.stack.peek().index += 1;

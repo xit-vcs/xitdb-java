@@ -23,8 +23,17 @@ public class Database {
     public static final long MASK = SLOT_COUNT - 1;
     public static final BigInteger BIG_MASK = BigInteger.valueOf(MASK);
     public static final int INDEX_BLOCK_SIZE = Slot.length * SLOT_COUNT;
-    public static final int LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE = LinkedArrayListSlot.length * SLOT_COUNT;
     public static final int MAX_BRANCH_LENGTH = 16;
+
+    // b-tree (backs the linked_array_list, and the sorted_map/sorted_set)
+    public static final int BTREE_SLOT_COUNT = SLOT_COUNT; // max entries per leaf / children per branch
+    public static final int BTREE_SPLIT_COUNT = (BTREE_SLOT_COUNT + 1) / 2; // left side of a split
+    // on-disk node block: [kind: u8][num: u8] followed by, for a leaf,
+    // BTREE_SLOT_COUNT value slots; for a branch, BTREE_SLOT_COUNT child slots
+    // then BTREE_SLOT_COUNT u64 subtree counts
+    public static final int BTREE_NODE_HEADER_SIZE = 2;
+    public static final int BTREE_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
+    public static final int BTREE_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (Slot.length + 8) * BTREE_SLOT_COUNT;
 
     public static enum WriteMode {
         READ_ONLY,
@@ -287,31 +296,6 @@ public class Database {
             return buffer.array();
         }
     }
-
-    public static record LinkedArrayListHeader(byte shift, long ptr, long size) {
-        public static int length = 17;
-
-        public byte[] toBytes() {
-            var buffer = ByteBuffer.allocate(length);
-            buffer.putLong(this.size);
-            buffer.putLong(this.ptr);
-            buffer.put((byte) (this.shift & 0b0011_1111));
-            return buffer.array();
-        }
-
-        public static LinkedArrayListHeader fromBytes(byte[] bytes) {
-            var buffer = ByteBuffer.wrap(bytes);
-            var size = checkLong(buffer.getLong());
-            var ptr = checkLong(buffer.getLong());
-            var shift = (byte) (buffer.get() & 0b0011_1111);
-            return new LinkedArrayListHeader(shift, ptr, size);
-        }
-
-        public LinkedArrayListHeader withPtr(long ptr) {
-            return new LinkedArrayListHeader(this.shift, ptr, this.size);
-        }
-    }
-
     public static record KeyValuePair(Slot valueSlot, Slot keySlot, byte[] hash) {
         public static int length(int hashSize) {
             return hashSize + Slot.length * 2;
@@ -338,6 +322,63 @@ public class Database {
             return new KeyValuePair(valueSlot, keySlot, hash);
         }
     }
+
+    // header for both B+trees (the positional linked_array_list and the sorted
+    // sorted_map/sorted_set): a root pointer plus the element count
+    public static record BTreeHeader(long rootPtr, long size) {
+        public static int length = 16;
+
+        public byte[] toBytes() {
+            var buffer = ByteBuffer.allocate(length);
+            buffer.putLong(this.size);
+            buffer.putLong(this.rootPtr);
+            return buffer.array();
+        }
+
+        public static BTreeHeader fromBytes(byte[] bytes) {
+            var buffer = ByteBuffer.wrap(bytes);
+            var size = checkLong(buffer.getLong());
+            var rootPtr = checkLong(buffer.getLong());
+            return new BTreeHeader(rootPtr, size);
+        }
+    }
+
+    public static enum BTreeNodeKind { LEAF, BRANCH }
+
+    public static final class BTreeNode {
+        public BTreeNodeKind kind;
+        public int num;
+        public Slot[] values = new Slot[BTREE_SLOT_COUNT];   // leaf
+        public Slot[] children = new Slot[BTREE_SLOT_COUNT]; // branch
+        public long[] counts = new long[BTREE_SLOT_COUNT];   // branch
+
+        public BTreeNode(BTreeNodeKind kind, int num) {
+            this.kind = kind;
+            this.num = num;
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                this.values[i] = new Slot();
+                this.children[i] = new Slot();
+            }
+        }
+
+        public long subtreeCount() {
+            if (this.kind == BTreeNodeKind.LEAF) return this.num;
+            long total = 0;
+            for (int i = 0; i < this.num; i++) total += this.counts[i];
+            return total;
+        }
+    }
+
+    // a node pointer plus the element count of its subtree (the right sibling of a split)
+    public static record BTreeNodeRef(long nodePtr, long count) {}
+
+    public static record BTreeInsertResult(long nodePtr, long count, long valuePosition, BTreeNodeRef split) {}
+
+    public static record BTreeWriteSlot(long nodePtr, long valuePosition, Slot slot) {}
+
+    public static record BTreeJoinResult(long nodePtr, long count, BTreeNodeRef split) {}
+
+    public static record BTreeSplitResult(long left, long right) {}
 
     public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, WriteData, Context {
         public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception;
@@ -543,56 +584,40 @@ public class Database {
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
             long position = slotPtr.position();
 
+            var writer = db.core.writer();
+
             switch (slotPtr.slot().tag()) {
                 case NONE -> {
-                    // if slot was empty, insert the new list
-                    var writer = db.core.writer();
-                    var arrayListStart = db.core.length();
-                    db.core.seek(arrayListStart);
-                    var arrayListPtr = arrayListStart + LinkedArrayListHeader.length;
-                    writer.write(new LinkedArrayListHeader(
-                        (byte)0,
-                        arrayListPtr,
-                        0
-                    ).toBytes());
-                    writer.write(new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE]);
-                    // make slot point to list
-                    var nextSlotPtr = new SlotPointer(position, new Slot(arrayListStart, Tag.LINKED_ARRAY_LIST));
+                    // create an empty tree: a single empty leaf plus a header
+                    var rootPtr = db.writeBTreeNode(new BTreeNode(BTreeNodeKind.LEAF, 0));
+                    var headerPtr = db.core.length();
+                    db.core.seek(headerPtr);
+                    writer.write(new BTreeHeader(rootPtr, 0).toBytes());
+                    var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, Tag.LINKED_ARRAY_LIST));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
                     return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
                 }
                 case LINKED_ARRAY_LIST -> {
-                    var reader = db.core.reader();
-                    var writer = db.core.writer();
-
-                    var arrayListStart = slotPtr.slot().value();
-
-                    // copy it to the end unless it was made in this transaction
+                    var headerPtr = slotPtr.slot().value();
+                    // copy the header into this transaction unless it was made in it,
+                    // so past moments still pointing at the old header are unaffected.
+                    // b-tree nodes are always appended, so only the header (updated in
+                    // place by later operations in this tx) needs copying.
                     if (db.txStart != null) {
-                        if (arrayListStart < db.txStart) {
-                            // read existing block
-                            db.core.seek(arrayListStart);
-                            var headerBytes = new byte[LinkedArrayListHeader.length];
+                        if (headerPtr < db.txStart) {
+                            var reader = db.core.reader();
+                            db.core.seek(headerPtr);
+                            var headerBytes = new byte[BTreeHeader.length];
                             reader.readFully(headerBytes);
-                            var header = LinkedArrayListHeader.fromBytes(headerBytes);
-                            db.core.seek(header.ptr);
-                            var arrayListIndexBlock = new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE];
-                            reader.readFully(arrayListIndexBlock);
-                            // copy to the end
-                            arrayListStart = db.core.length();
-                            db.core.seek(arrayListStart);
-                            var nextArrayListPtr = arrayListStart + LinkedArrayListHeader.length;
-                            header = header.withPtr(nextArrayListPtr);
-                            writer.write(header.toBytes());
-                            writer.write(arrayListIndexBlock);
+                            headerPtr = db.core.length();
+                            db.core.seek(headerPtr);
+                            writer.write(headerBytes);
                         }
                     } else if (db.header.tag() == Tag.ARRAY_LIST) {
                         throw new ExpectedTxStartException();
                     }
-
-                    // make slot point to list
-                    var nextSlotPtr = new SlotPointer(position, new Slot(arrayListStart, Tag.LINKED_ARRAY_LIST));
+                    var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, Tag.LINKED_ARRAY_LIST));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
                     return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
@@ -612,19 +637,33 @@ public class Database {
 
             var index = this.index();
 
-            db.core.seek(slotPtr.slot().value());
+            var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
-            var headerBytes = new byte[LinkedArrayListHeader.length];
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
             reader.readFully(headerBytes);
-            var header = LinkedArrayListHeader.fromBytes(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
             if (index >= header.size() || index < -header.size()) {
                 throw new KeyNotFoundException();
             }
+            var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
-            var key = index < 0 ? header.size - Math.abs(index) : index;
-            var finalSlotPtr = db.readLinkedArrayListSlot(header.ptr(), key, header.shift(), writeMode, isTopLevel);
-
-            return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr.slotPtr());
+            if (writeMode == WriteMode.READ_ONLY) {
+                var finalSlotPtr = db.readBTreeSlot(header.rootPtr(), rank);
+                return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr);
+            } else {
+                // path-copy down to the value slot so the write is persistent
+                var writeSlot = db.btreeGetForWrite(header.rootPtr(), rank);
+                var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(writeSlot.valuePosition(), writeSlot.slot()));
+                // the header only needs rewriting if the root actually moved (it stays
+                // put when the whole path was already this-transaction)
+                if (writeSlot.nodePtr() != header.rootPtr()) {
+                    var writer = db.core.writer();
+                    db.core.seek(headerPtr);
+                    writer.write(new BTreeHeader(writeSlot.nodePtr(), header.size()).toBytes());
+                }
+                return finalSlotPtr;
+            }
         }
     }
 
@@ -634,23 +673,23 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
-            var nextArrayListStart = slotPtr.slot().value();
-
-            // read header
-            db.core.seek(nextArrayListStart);
-            var headerBytes = new byte[LinkedArrayListHeader.length];
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
             reader.readFully(headerBytes);
-            var origHeader = LinkedArrayListHeader.fromBytes(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
 
-            // append
-            var appendResult = db.readLinkedArrayListSlotAppend(origHeader, writeMode, isTopLevel);
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, appendResult.slotPtr().slotPtr());
+            var result = db.btreeInsert(header.rootPtr(), header.size());
+            var newRootPtr = db.btreeGrowRoot(result);
+
+            // fill in the value via the rest of the path
+            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
 
             // update header
             var writer = db.core.writer();
-            db.core.seek(nextArrayListStart);
-            writer.write(appendResult.header().toBytes());
+            db.core.seek(headerPtr);
+            writer.write(new BTreeHeader(newRootPtr, header.size() + 1).toBytes());
 
             return finalSlotPtr;
         }
@@ -662,23 +701,28 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
-            var nextArrayListStart = slotPtr.slot().value();
-
-            // read header
-            db.core.seek(nextArrayListStart);
-            var headerBytes = new byte[LinkedArrayListHeader.length];
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
             reader.readFully(headerBytes);
-            var origHeader = LinkedArrayListHeader.fromBytes(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
 
-            // slice
-            var sliceHeader = db.readLinkedArrayListSlice(origHeader, this.offset(), this.size());
+            // bounds-checked without overflow (offset + size could wrap)
+            if (this.offset() > header.size() || this.size() > header.size() - this.offset()) {
+                throw new KeyNotFoundException();
+            }
+
+            // slice = drop [0, offset) then keep [0, size) of what's left
+            var afterOffset = db.btreeSplit(header.rootPtr(), this.offset());
+            var sliced = db.btreeSplit(afterOffset.right(), this.size());
+            var newRootPtr = sliced.left();
             var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
             // update header
             var writer = db.core.writer();
-            db.core.seek(nextArrayListStart);
-            writer.write(sliceHeader.toBytes());
+            db.core.seek(headerPtr);
+            writer.write(new BTreeHeader(newRootPtr, this.size()).toBytes());
 
             return finalSlotPtr;
         }
@@ -692,27 +736,29 @@ public class Database {
 
             if (this.list().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
-            var nextArrayListStart = slotPtr.slot().value();
-
-            // read headers
-            db.core.seek(nextArrayListStart);
-            var headerBytesA = new byte[LinkedArrayListHeader.length];
+            db.core.seek(headerPtr);
+            var headerBytesA = new byte[BTreeHeader.length];
             reader.readFully(headerBytesA);
-            var headerA = LinkedArrayListHeader.fromBytes(headerBytesA);
-            db.core.seek(this.list.value());
-            var headerBytesB = new byte[LinkedArrayListHeader.length];
+            var headerA = BTreeHeader.fromBytes(headerBytesA);
+            db.core.seek(this.list().value());
+            var headerBytesB = new byte[BTreeHeader.length];
             reader.readFully(headerBytesB);
-            var headerB = LinkedArrayListHeader.fromBytes(headerBytesB);
+            var headerB = BTreeHeader.fromBytes(headerBytesB);
 
-            // concat
-            var concatHeader = db.readLinkedArrayListConcat(headerA, headerB);
+            // the join result shares subtrees with both operands (and the second
+            // operand stays live), so freeze everything created so far: later in-place
+            // mutations will then copy those nodes instead of overwriting a node that
+            // is still referenced elsewhere.
+            db.txStart = db.core.length();
+            var newRootPtr = db.btreeJoin(headerA.rootPtr(), headerB.rootPtr());
             var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
             // update header
             var writer = db.core.writer();
-            db.core.seek(nextArrayListStart);
-            writer.write(concatHeader.toBytes());
+            db.core.seek(headerPtr);
+            writer.write(new BTreeHeader(newRootPtr, headerA.size() + headerB.size()).toBytes());
 
             return finalSlotPtr;
         }
@@ -724,42 +770,28 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
-            var nextArrayListStart = slotPtr.slot().value();
-
-            // read header
-            db.core.seek(nextArrayListStart);
-            var headerBytes = new byte[LinkedArrayListHeader.length];
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
             reader.readFully(headerBytes);
-            var origHeader = LinkedArrayListHeader.fromBytes(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
 
-            // get the key
             var index = this.index();
-            if (index >= origHeader.size || index < -origHeader.size) {
+            if (index >= header.size() || index < -header.size()) {
                 throw new KeyNotFoundException();
             }
-            var key = index < 0 ? origHeader.size - Math.abs(index) : index;
+            var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
-            // split up the list
-            var headerA = db.readLinkedArrayListSlice(origHeader, 0, key);
-            var headerB = db.readLinkedArrayListSlice(origHeader, key, origHeader.size - key);
+            var result = db.btreeInsert(header.rootPtr(), rank);
+            var newRootPtr = db.btreeGrowRoot(result);
 
-            // add new slot to first list
-            var appendResult = db.readLinkedArrayListSlotAppend(headerA, writeMode, isTopLevel);
-
-            // concat the lists
-            var concatHeader = db.readLinkedArrayListConcat(appendResult.header(), headerB);
-
-            // get pointer to the new slot
-            var nextSlotPtr = db.readLinkedArrayListSlot(concatHeader.ptr(), key, concatHeader.shift(), WriteMode.READ_ONLY, isTopLevel);
-
-            // recur down the rest of the path
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr.slotPtr());
+            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
 
             // update header
             var writer = db.core.writer();
-            db.core.seek(nextArrayListStart);
-            writer.write(concatHeader.toBytes());
+            db.core.seek(headerPtr);
+            writer.write(new BTreeHeader(newRootPtr, header.size() + 1).toBytes());
 
             return finalSlotPtr;
         }
@@ -771,39 +803,29 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
-            var nextArrayListStart = slotPtr.slot().value();
-
-            // read header
-            db.core.seek(nextArrayListStart);
-            var headerBytes = new byte[LinkedArrayListHeader.length];
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
             reader.readFully(headerBytes);
-            var origHeader = LinkedArrayListHeader.fromBytes(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
 
-            // get the key
             var index = this.index();
-            if (index >= origHeader.size || index < -origHeader.size) {
+            if (index >= header.size() || index < -header.size()) {
                 throw new KeyNotFoundException();
             }
-            var key = index < 0 ? origHeader.size - Math.abs(index) : index;
+            var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
-            // split up the list
-            var headerA = db.readLinkedArrayListSlice(origHeader, 0, key);
-            var headerB = db.readLinkedArrayListSlice(origHeader, key + 1, origHeader.size - (key + 1));
-
-            // concat the lists
-            var concatHeader = db.readLinkedArrayListConcat(headerA, headerB);
-
-            // get pointer to the new list
-            var nextSlotPtr = new SlotPointer(concatHeader.ptr(), new Slot(nextArrayListStart, Tag.LINKED_ARRAY_LIST));
-
-            // recur down the rest of the path
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+            // remove = join the parts before and after the removed element
+            var before = db.btreeSplit(header.rootPtr(), rank);
+            var after = db.btreeSplit(before.right(), 1);
+            var newRootPtr = db.btreeJoin(before.left(), after.right());
+            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
             // update header
             var writer = db.core.writer();
-            db.core.seek(nextArrayListStart);
-            writer.write(concatHeader.toBytes());
+            db.core.seek(headerPtr);
+            writer.write(new BTreeHeader(newRootPtr, header.size() - 1).toBytes());
 
             return finalSlotPtr;
         }
@@ -1099,39 +1121,6 @@ public class Database {
             return true;
         }
     }
-
-    public static record LinkedArrayListSlot(long size, Slot slot) {
-        public static int length = 8 + Slot.length;
-
-        public LinkedArrayListSlot withSize(long size) {
-            return new LinkedArrayListSlot(size, this.slot);
-        }
-
-        public byte[] toBytes() {
-            var buffer = ByteBuffer.allocate(length);
-            buffer.put(this.slot.toBytes());
-            buffer.putLong(this.size);
-            return buffer.array();
-        }
-
-        public static LinkedArrayListSlot fromBytes(byte[] bytes) {
-            var buffer = ByteBuffer.wrap(bytes);
-            var slotBytes = new byte[Slot.length];
-            buffer.get(slotBytes);
-            var slot = Slot.fromBytes(slotBytes);
-            var size = checkLong(buffer.getLong());
-            return new LinkedArrayListSlot(size, slot);
-        }
-    }
-
-    public static record LinkedArrayListSlotPointer(SlotPointer slotPtr, long leafCount) {
-        public LinkedArrayListSlotPointer withSlotPointer(SlotPointer slotPtr) {
-            return new LinkedArrayListSlotPointer(slotPtr, this.leafCount);
-        }
-    }
-
-    public static record LinkedArrayListBlockInfo(LinkedArrayListSlot[] block, byte i, LinkedArrayListSlot parentSlot) {}
-
     // exceptions
 
     public static class DatabaseException extends RuntimeException {}
@@ -1159,6 +1148,8 @@ public class Database {
     public static class InvalidFormatTagSizeException extends DatabaseException {}
     public static class UnexpectedWriterPositionException extends DatabaseException {}
     public static class MaxShiftExceededException extends DatabaseException {}
+    public static class InvalidBTreeNodeException extends DatabaseException {}
+    public static class InvalidBTreeNodeKindException extends DatabaseException {}
 
     // hash_map
 
@@ -1423,6 +1414,445 @@ public class Database {
         return new Slot(indexPos, Tag.INDEX);
     }
 
+    // b-tree
+
+    private BTreeNode readBTreeNode(long ptr) throws IOException {
+        this.core.seek(ptr);
+        var reader = this.core.reader();
+        var headerBytes = new byte[BTREE_NODE_HEADER_SIZE];
+        reader.readFully(headerBytes);
+        var kindInt = headerBytes[0] & 0xFF;
+        if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+        var kind = BTreeNodeKind.values()[kindInt];
+        var num = headerBytes[1] & 0xFF;
+        if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
+        var node = new BTreeNode(kind, num);
+        switch (kind) {
+            case LEAF -> {
+                var body = new byte[Slot.length * BTREE_SLOT_COUNT];
+                reader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    node.values[i] = Slot.fromBytes(slotBytes);
+                }
+            }
+            case BRANCH -> {
+                var body = new byte[(Slot.length + 8) * BTREE_SLOT_COUNT];
+                reader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    node.children[i] = Slot.fromBytes(slotBytes);
+                }
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    node.counts[i] = buffer.getLong();
+                }
+            }
+        }
+        return node;
+    }
+
+    // always writes the node as a block at ptr. b-tree mutations are persistent:
+    // every node on the path from the root is rewritten, while untouched subtrees
+    // are shared by pointer.
+    private void writeBTreeNodeAt(BTreeNode node, long ptr) throws IOException {
+        this.core.seek(ptr);
+        var writer = this.core.writer();
+        int bodySize = node.kind == BTreeNodeKind.LEAF
+            ? BTREE_LEAF_BLOCK_SIZE
+            : BTREE_BRANCH_BLOCK_SIZE;
+        var buffer = ByteBuffer.allocate(bodySize);
+        buffer.put((byte) node.kind.ordinal());
+        buffer.put((byte) node.num);
+        switch (node.kind) {
+            case LEAF -> {
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.put(node.values[i].toBytes());
+            }
+            case BRANCH -> {
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.put(node.children[i].toBytes());
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.putLong(node.counts[i]);
+            }
+        }
+        writer.write(buffer.array());
+    }
+
+    // appends the node as a fresh block and returns its position
+    private long writeBTreeNode(BTreeNode node) throws IOException {
+        var ptr = this.core.length();
+        writeBTreeNodeAt(node, ptr);
+        return ptr;
+    }
+
+    // a node is safe to mutate in place when it was created in the current
+    // transaction (offset >= txStart), since no committed moment and no pre-concat
+    // sharing can reference it. concat advances txStart (an implicit freeze)
+    // precisely so its shared subtrees fall below it here. for an ephemeral
+    // (non-array-list) top level there is no transaction, so everything is mutable
+    // in place until a concat first sets txStart.
+    private boolean btreeReusable(long ptr) throws IOException {
+        if (this.txStart != null) return ptr >= this.txStart;
+        return this.header.tag() != Tag.ARRAY_LIST;
+    }
+
+    // write a new version of a node, reusing oldPtr's position in place if that node
+    // belongs to this transaction, otherwise appending a copy
+    private long btreeWriteNode(BTreeNode node, long oldPtr) throws IOException {
+        if (btreeReusable(oldPtr)) {
+            writeBTreeNodeAt(node, oldPtr);
+            return oldPtr;
+        }
+        return writeBTreeNode(node);
+    }
+
+    private long btreeNewRoot() throws IOException {
+        return writeBTreeNode(new BTreeNode(BTreeNodeKind.LEAF, 0));
+    }
+
+    // descend to the value slot at the given rank (0-based), returning a pointer
+    // to it (its file position and current slot).
+    private SlotPointer readBTreeSlot(long rootPtr, long rank) throws IOException {
+        var nodePtr = rootPtr;
+        var rem = rank;
+        while (true) {
+            var node = readBTreeNode(nodePtr);
+            switch (node.kind) {
+                case LEAF -> {
+                    var position = nodePtr + BTREE_NODE_HEADER_SIZE + rem * Slot.length;
+                    return new SlotPointer(position, node.values[(int) rem]);
+                }
+                case BRANCH -> {
+                    int i = 0;
+                    while (i + 1 < node.num && rem >= node.counts[i]) {
+                        rem -= node.counts[i];
+                        i++;
+                    }
+                    nodePtr = node.children[i].value();
+                }
+            }
+        }
+    }
+
+    // insert a placeholder slot at `rank` within the subtree at nodePtr, writing new
+    // nodes along the path. the caller fills in the value at the returned valuePosition.
+    private BTreeInsertResult btreeInsert(long nodePtr, long rank) throws IOException {
+        var node = readBTreeNode(nodePtr);
+        switch (node.kind) {
+            case LEAF -> {
+                // build the entries with a placeholder spliced in at `rank`. the
+                // placeholder is a NONE slot marked full so that, if the caller never
+                // writes a value (e.g. appendCursor), iteration still counts it as an
+                // element rather than skipping it as padding.
+                var vals = new Slot[BTREE_SLOT_COUNT + 1];
+                int r = (int) rank;
+                System.arraycopy(node.values, 0, vals, 0, r);
+                vals[r] = new Slot(0, Tag.NONE, true);
+                System.arraycopy(node.values, r, vals, r + 1, node.num - r);
+                int total = node.num + 1;
+
+                if (total <= BTREE_SLOT_COUNT) {
+                    var leaf = new BTreeNode(BTreeNodeKind.LEAF, total);
+                    System.arraycopy(vals, 0, leaf.values, 0, total);
+                    var ptr = btreeWriteNode(leaf, nodePtr);
+                    return new BTreeInsertResult(ptr, total, ptr + BTREE_NODE_HEADER_SIZE + (long) r * Slot.length, null);
+                }
+
+                // overflow: split into two leaves (reuse this node for the left half)
+                int leftN = BTREE_SPLIT_COUNT;
+                int rightN = total - leftN;
+                var left = new BTreeNode(BTreeNodeKind.LEAF, leftN);
+                System.arraycopy(vals, 0, left.values, 0, leftN);
+                var right = new BTreeNode(BTreeNodeKind.LEAF, rightN);
+                System.arraycopy(vals, leftN, right.values, 0, rightN);
+                var leftPtr = btreeWriteNode(left, nodePtr);
+                var rightPtr = writeBTreeNode(right);
+                long valuePosition = (r < leftN)
+                    ? leftPtr + BTREE_NODE_HEADER_SIZE + (long) r * Slot.length
+                    : rightPtr + BTREE_NODE_HEADER_SIZE + (long) (r - leftN) * Slot.length;
+                return new BTreeInsertResult(leftPtr, leftN, valuePosition, new BTreeNodeRef(rightPtr, rightN));
+            }
+            case BRANCH -> {
+                // pick the child that contains `rank`
+                int i = 0;
+                long rem = rank;
+                while (i + 1 < node.num && rem > node.counts[i]) {
+                    rem -= node.counts[i];
+                    i++;
+                }
+                var child = btreeInsert(node.children[i].value(), rem);
+
+                // rebuild this branch with the (possibly split) child
+                var children = new Slot[BTREE_SLOT_COUNT + 1];
+                var counts = new long[BTREE_SLOT_COUNT + 1];
+                System.arraycopy(node.children, 0, children, 0, node.num);
+                System.arraycopy(node.counts, 0, counts, 0, node.num);
+                children[i] = new Slot(child.nodePtr(), Tag.INDEX);
+                counts[i] = child.count();
+                int total = node.num;
+                if (child.split() != null) {
+                    for (int j = node.num; j > i + 1; j--) {
+                        children[j] = children[j - 1];
+                        counts[j] = counts[j - 1];
+                    }
+                    children[i + 1] = new Slot(child.split().nodePtr(), Tag.INDEX);
+                    counts[i + 1] = child.split().count();
+                    total = node.num + 1;
+                }
+
+                if (total <= BTREE_SLOT_COUNT) {
+                    var branch = new BTreeNode(BTreeNodeKind.BRANCH, total);
+                    System.arraycopy(children, 0, branch.children, 0, total);
+                    System.arraycopy(counts, 0, branch.counts, 0, total);
+                    var ptr = btreeWriteNode(branch, nodePtr);
+                    return new BTreeInsertResult(ptr, branch.subtreeCount(), child.valuePosition(), null);
+                }
+
+                // overflow: split into two branches (reuse this node for the left half)
+                int leftN = BTREE_SPLIT_COUNT;
+                int rightN = total - leftN;
+                var left = new BTreeNode(BTreeNodeKind.BRANCH, leftN);
+                System.arraycopy(children, 0, left.children, 0, leftN);
+                System.arraycopy(counts, 0, left.counts, 0, leftN);
+                var right = new BTreeNode(BTreeNodeKind.BRANCH, rightN);
+                System.arraycopy(children, leftN, right.children, 0, rightN);
+                System.arraycopy(counts, leftN, right.counts, 0, rightN);
+                var leftPtr = btreeWriteNode(left, nodePtr);
+                var rightPtr = writeBTreeNode(right);
+                return new BTreeInsertResult(leftPtr, left.subtreeCount(), child.valuePosition(),
+                    new BTreeNodeRef(rightPtr, right.subtreeCount()));
+            }
+        }
+        throw new UnreachableException();
+    }
+
+    // turn an insert result into a root pointer, growing the tree a level if the old
+    // root split (shares the root-building logic with btreeMakeRoot)
+    private long btreeGrowRoot(BTreeInsertResult result) throws IOException {
+        return btreeMakeRoot(new BTreeJoinResult(result.nodePtr(), result.count(), result.split()));
+    }
+
+    // descend to the value slot at `rank` for writing, copy-on-writing only the nodes
+    // that belong to a past transaction. the element count is unchanged, so when the
+    // whole path is already this-transaction nothing is rewritten and the caller
+    // writes straight into the existing leaf.
+    private BTreeWriteSlot btreeGetForWrite(long nodePtr, long rank) throws IOException {
+        var node = readBTreeNode(nodePtr);
+        switch (node.kind) {
+            case LEAF -> {
+                var newPtr = btreeReusable(nodePtr) ? nodePtr : writeBTreeNode(node);
+                return new BTreeWriteSlot(newPtr, newPtr + BTREE_NODE_HEADER_SIZE + rank * Slot.length, node.values[(int) rank]);
+            }
+            case BRANCH -> {
+                int i = 0;
+                long rem = rank;
+                while (i + 1 < node.num && rem >= node.counts[i]) {
+                    rem -= node.counts[i];
+                    i++;
+                }
+                var child = btreeGetForWrite(node.children[i].value(), rem);
+                // if the child stayed put, this branch is unchanged too
+                if (child.nodePtr() == node.children[i].value()) {
+                    return new BTreeWriteSlot(nodePtr, child.valuePosition(), child.slot());
+                }
+                node.children[i] = new Slot(child.nodePtr(), Tag.INDEX);
+                var newPtr = btreeWriteNode(node, nodePtr);
+                return new BTreeWriteSlot(newPtr, child.valuePosition(), child.slot());
+            }
+        }
+        throw new UnreachableException();
+    }
+
+    // join (concat): a true O(log n), structure-sharing concatenation of two trees
+    // where every element of `a` precedes every element of `b`. unlike the rebuild
+    // helpers above, untouched subtrees are shared by pointer, so concatenating a
+    // list with itself stays cheap.
+
+    // height of a tree = number of branch levels above the leaves
+    private int btreeHeight(long rootPtr) throws IOException {
+        var ptr = rootPtr;
+        int height = 0;
+        while (true) {
+            var node = readBTreeNode(ptr);
+            if (node.kind == BTreeNodeKind.LEAF) return height;
+            height++;
+            ptr = node.children[0].value();
+        }
+    }
+
+    private long btreeMakeRoot(BTreeJoinResult result) throws IOException {
+        if (result.split() != null) {
+            var root = new BTreeNode(BTreeNodeKind.BRANCH, 2);
+            root.children[0] = new Slot(result.nodePtr(), Tag.INDEX);
+            root.children[1] = new Slot(result.split().nodePtr(), Tag.INDEX);
+            root.counts[0] = result.count();
+            root.counts[1] = result.split().count();
+            return writeBTreeNode(root);
+        }
+        return result.nodePtr();
+    }
+
+    // write `vals` as one leaf, or split into two balanced leaves if it exceeds the
+    // node capacity
+    private BTreeJoinResult btreeAssembleLeaf(Slot[] vals, int total) throws IOException {
+        if (total <= BTREE_SLOT_COUNT) {
+            var leaf = new BTreeNode(BTreeNodeKind.LEAF, total);
+            System.arraycopy(vals, 0, leaf.values, 0, total);
+            return new BTreeJoinResult(writeBTreeNode(leaf), total, null);
+        }
+        int leftN = total / 2;
+        var left = new BTreeNode(BTreeNodeKind.LEAF, leftN);
+        System.arraycopy(vals, 0, left.values, 0, leftN);
+        var right = new BTreeNode(BTreeNodeKind.LEAF, total - leftN);
+        System.arraycopy(vals, leftN, right.values, 0, total - leftN);
+        return new BTreeJoinResult(writeBTreeNode(left), leftN, new BTreeNodeRef(writeBTreeNode(right), total - leftN));
+    }
+
+    // write `children`/`counts` as one branch, or split into two balanced branches
+    private BTreeJoinResult btreeAssembleBranch(Slot[] children, long[] counts, int total) throws IOException {
+        if (total <= BTREE_SLOT_COUNT) {
+            var branch = new BTreeNode(BTreeNodeKind.BRANCH, total);
+            System.arraycopy(children, 0, branch.children, 0, total);
+            System.arraycopy(counts, 0, branch.counts, 0, total);
+            return new BTreeJoinResult(writeBTreeNode(branch), branch.subtreeCount(), null);
+        }
+        int leftN = total / 2;
+        var left = new BTreeNode(BTreeNodeKind.BRANCH, leftN);
+        System.arraycopy(children, 0, left.children, 0, leftN);
+        System.arraycopy(counts, 0, left.counts, 0, leftN);
+        var right = new BTreeNode(BTreeNodeKind.BRANCH, total - leftN);
+        System.arraycopy(children, leftN, right.children, 0, total - leftN);
+        System.arraycopy(counts, leftN, right.counts, 0, total - leftN);
+        return new BTreeJoinResult(writeBTreeNode(left), left.subtreeCount(),
+            new BTreeNodeRef(writeBTreeNode(right), right.subtreeCount()));
+    }
+
+    // merge two nodes of equal height (a precedes b) into one or two nodes
+    private BTreeJoinResult btreeMergeNodes(BTreeNode a, BTreeNode b) throws IOException {
+        switch (a.kind) {
+            case LEAF -> {
+                var vals = new Slot[2 * BTREE_SLOT_COUNT];
+                System.arraycopy(a.values, 0, vals, 0, a.num);
+                System.arraycopy(b.values, 0, vals, a.num, b.num);
+                return btreeAssembleLeaf(vals, a.num + b.num);
+            }
+            case BRANCH -> {
+                var children = new Slot[2 * BTREE_SLOT_COUNT];
+                var counts = new long[2 * BTREE_SLOT_COUNT];
+                System.arraycopy(a.children, 0, children, 0, a.num);
+                System.arraycopy(a.counts, 0, counts, 0, a.num);
+                System.arraycopy(b.children, 0, children, a.num, b.num);
+                System.arraycopy(b.counts, 0, counts, a.num, b.num);
+                return btreeAssembleBranch(children, counts, a.num + b.num);
+            }
+        }
+        throw new UnreachableException();
+    }
+
+    // join b (shorter) into the rightmost spine of a (taller), at height hb
+    private BTreeJoinResult btreeJoinRight(long aPtr, int ha, long bPtr, int hb) throws IOException {
+        var a = readBTreeNode(aPtr);
+        int last = a.num - 1;
+        var sub = (ha - 1 == hb)
+            ? btreeMergeNodes(readBTreeNode(a.children[last].value()), readBTreeNode(bPtr))
+            : btreeJoinRight(a.children[last].value(), ha - 1, bPtr, hb);
+
+        var children = new Slot[BTREE_SLOT_COUNT + 1];
+        var counts = new long[BTREE_SLOT_COUNT + 1];
+        System.arraycopy(a.children, 0, children, 0, a.num);
+        System.arraycopy(a.counts, 0, counts, 0, a.num);
+        children[last] = new Slot(sub.nodePtr(), Tag.INDEX);
+        counts[last] = sub.count();
+        int total = a.num;
+        if (sub.split() != null) {
+            children[total] = new Slot(sub.split().nodePtr(), Tag.INDEX);
+            counts[total] = sub.split().count();
+            total += 1;
+        }
+        return btreeAssembleBranch(children, counts, total);
+    }
+
+    // join a (shorter) into the leftmost spine of b (taller), at height ha
+    private BTreeJoinResult btreeJoinLeft(long aPtr, int ha, long bPtr, int hb) throws IOException {
+        var b = readBTreeNode(bPtr);
+        var sub = (hb - 1 == ha)
+            ? btreeMergeNodes(readBTreeNode(aPtr), readBTreeNode(b.children[0].value()))
+            : btreeJoinLeft(aPtr, ha, b.children[0].value(), hb - 1);
+
+        var children = new Slot[BTREE_SLOT_COUNT + 1];
+        var counts = new long[BTREE_SLOT_COUNT + 1];
+        children[0] = new Slot(sub.nodePtr(), Tag.INDEX);
+        counts[0] = sub.count();
+        int head = 1;
+        if (sub.split() != null) {
+            children[1] = new Slot(sub.split().nodePtr(), Tag.INDEX);
+            counts[1] = sub.split().count();
+            head = 2;
+        }
+        System.arraycopy(b.children, 1, children, head, b.num - 1);
+        System.arraycopy(b.counts, 1, counts, head, b.num - 1);
+        return btreeAssembleBranch(children, counts, head + b.num - 1);
+    }
+
+    private long btreeJoin(long rootA, long rootB) throws IOException {
+        int ha = btreeHeight(rootA);
+        int hb = btreeHeight(rootB);
+        BTreeJoinResult result;
+        if (ha == hb) {
+            result = btreeMergeNodes(readBTreeNode(rootA), readBTreeNode(rootB));
+        } else if (ha > hb) {
+            result = btreeJoinRight(rootA, ha, rootB, hb);
+        } else {
+            result = btreeJoinLeft(rootA, ha, rootB, hb);
+        }
+        return btreeMakeRoot(result);
+    }
+
+    // split (used by slice and remove): a true O(log n), structure-sharing split of a
+    // tree into [0, rank) and [rank, size). partial nodes along the path are
+    // reassembled with join, so the result trees stay balanced.
+
+    // build a tree from a run of sibling children (already height-h-1 subtrees):
+    // empty -> a new empty leaf, one -> that child unwrapped, many -> a branch
+    private long btreeSubtree(Slot[] children, long[] counts, int start, int len) throws IOException {
+        if (len == 0) return btreeNewRoot();
+        if (len == 1) return children[start].value();
+        // len <= BTREE_SLOT_COUNT here, so this never splits
+        var subChildren = new Slot[len];
+        var subCounts = new long[len];
+        System.arraycopy(children, start, subChildren, 0, len);
+        System.arraycopy(counts, start, subCounts, 0, len);
+        return btreeAssembleBranch(subChildren, subCounts, len).nodePtr();
+    }
+
+    private BTreeSplitResult btreeSplit(long rootPtr, long rank) throws IOException {
+        var node = readBTreeNode(rootPtr);
+        switch (node.kind) {
+            case LEAF -> {
+                int r = (int) rank;
+                var left = new BTreeNode(BTreeNodeKind.LEAF, r);
+                System.arraycopy(node.values, 0, left.values, 0, r);
+                var right = new BTreeNode(BTreeNodeKind.LEAF, node.num - r);
+                System.arraycopy(node.values, r, right.values, 0, node.num - r);
+                return new BTreeSplitResult(writeBTreeNode(left), writeBTreeNode(right));
+            }
+            case BRANCH -> {
+                int i = 0;
+                long rem = rank;
+                while (i + 1 < node.num && rem > node.counts[i]) {
+                    rem -= node.counts[i];
+                    i++;
+                }
+                var child = btreeSplit(node.children[i].value(), rem);
+                var leftSub = btreeSubtree(node.children, node.counts, 0, i);
+                var rightSub = btreeSubtree(node.children, node.counts, i + 1, node.num - (i + 1));
+                return new BTreeSplitResult(btreeJoin(leftSub, child.left()), btreeJoin(child.right(), rightSub));
+            }
+        }
+        throw new UnreachableException();
+    }
+
     // array_list
 
     public static record ArrayListAppendResult(ArrayListHeader header, SlotPointer slotPtr) {}
@@ -1549,605 +1979,6 @@ public class Database {
         }
     }
 
-    // linked_array_list
-
-    public static record LinkedArrayListAppendResult(LinkedArrayListHeader header, LinkedArrayListSlotPointer slotPtr) {}
-
-    private LinkedArrayListAppendResult readLinkedArrayListSlotAppend(LinkedArrayListHeader header, WriteMode writeMode, boolean isTopLevel) throws IOException {
-        var writer = this.core.writer();
-
-        var ptr = header.ptr;
-        var key = header.size;
-        var shift = header.shift;
-
-        LinkedArrayListSlotPointer slotPtr = null;
-        try {
-            slotPtr = readLinkedArrayListSlot(ptr, key, shift, writeMode, isTopLevel);
-        } catch (NoAvailableSlotsException e) {
-            // root overflow
-            var nextPtr = this.core.length();
-            this.core.seek(nextPtr);
-            writer.write(new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE]);
-            this.core.seek(nextPtr);
-            writer.write(new LinkedArrayListSlot(header.size, new Slot(ptr, Tag.INDEX, true)).toBytes());
-            ptr = nextPtr;
-            shift += 1;
-            slotPtr = readLinkedArrayListSlot(ptr, key, shift, writeMode, isTopLevel);
-        }
-
-        // newly-appended slots must have full set to true
-        // or else indexing will be screwed up
-        var newSlot = new Slot(0, Tag.NONE, true);
-        slotPtr = slotPtr.withSlotPointer(slotPtr.slotPtr().withSlot(newSlot));
-        if (slotPtr.slotPtr().position() == null) throw new CursorNotWriteableException();
-        long position = slotPtr.slotPtr().position();
-        this.core.seek(position);
-        writer.write(new LinkedArrayListSlot(0, newSlot).toBytes());
-        if (header.size < SLOT_COUNT && shift > 0) {
-            throw new MustSetNewSlotsToFullException();
-        }
-
-        return new LinkedArrayListAppendResult(
-            new LinkedArrayListHeader(shift, ptr, header.size + 1),
-            slotPtr
-        );
-    }
-
-    private static long blockLeafCount(LinkedArrayListSlot[] block, byte shift, byte i) {
-        long n = 0;
-        // for leaf nodes, count all non-empty slots along with the slot being accessed
-        if (shift == 0) {
-            for (int blockI = 0; blockI < block.length; blockI++) {
-                var blockSlot = block[blockI];
-                if (!blockSlot.slot().empty() || blockI == i) {
-                    n += 1;
-                }
-            }
-        }
-        // for non-leaf nodes, add up their sizes
-        else {
-            for (LinkedArrayListSlot blockSlot : block) {
-                n += blockSlot.size();
-            }
-        }
-        return n;
-    }
-
-    private static long slotLeafCount(LinkedArrayListSlot slot, byte shift) {
-        if (shift == 0) {
-            if (slot.slot().empty()) {
-                return 0;
-            } else {
-                return 1;
-            }
-        } else {
-            return slot.size();
-        }
-    }
-
-    private static record KeyAndIndex(long key, byte index) {}
-
-    private static KeyAndIndex keyAndIndexForLinkedArrayList(LinkedArrayListSlot[] slotBlock, long key, byte shift) {
-        long nextKey = key;
-        byte i = 0;
-        long maxLeafCount = (long) (shift == 0 ? 1 : Math.pow(SLOT_COUNT, shift));
-        while (true) {
-            var slotLeafCount = slotLeafCount(slotBlock[i], shift);
-            if (nextKey == slotLeafCount) {
-                // if the slot's leaf count is at its maximum
-                // or it is full, we have to skip to the next slot
-                if (slotLeafCount == maxLeafCount || slotBlock[i].slot().full()) {
-                    if (i < SLOT_COUNT - 1) {
-                        nextKey -= slotLeafCount;
-                        i += 1;
-                    } else {
-                        return null;
-                    }
-                }
-                break;
-            } else if (nextKey < slotLeafCount) {
-                break;
-            } else if (i < SLOT_COUNT - 1) {
-                nextKey -= slotLeafCount;
-                i += 1;
-            } else {
-                return null;
-            }
-        }
-        return new KeyAndIndex(nextKey, i);
-    }
-
-    private LinkedArrayListSlotPointer readLinkedArrayListSlot(long indexPos, long key, byte shift, WriteMode writeMode, boolean isTopLevel) throws IOException {
-        if (shift >= MAX_BRANCH_LENGTH) throw new MaxShiftExceededException();
-
-        var reader = this.core.reader();
-        var writer = this.core.writer();
-
-        var slotBlock = new LinkedArrayListSlot[SLOT_COUNT];
-        {
-            this.core.seek(indexPos);
-            var indexBlock = new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE];
-            reader.readFully(indexBlock);
-
-            var buffer = ByteBuffer.wrap(indexBlock);
-            for (int i = 0; i < slotBlock.length; i++) {
-                var slotBytes = new byte[LinkedArrayListSlot.length];
-                buffer.get(slotBytes);
-                slotBlock[i] = LinkedArrayListSlot.fromBytes(slotBytes);
-            }
-        }
-
-        var keyAndIndex = keyAndIndexForLinkedArrayList(slotBlock, key, shift);
-        if (keyAndIndex == null) throw new NoAvailableSlotsException();
-        var nextKey = keyAndIndex.key;
-        var i = keyAndIndex.index;
-        var slot = slotBlock[i];
-        var slotPos = indexPos + (LinkedArrayListSlot.length * i);
-
-        if (shift == 0) {
-            var leafCount = blockLeafCount(slotBlock, shift, i);
-            return new LinkedArrayListSlotPointer(new SlotPointer(slotPos, slot.slot()), leafCount);
-        }
-
-        var ptr = slot.slot().value();
-
-        switch (slot.slot().tag()) {
-            case NONE -> {
-                switch (writeMode) {
-                    case READ_ONLY -> throw new KeyNotFoundException();
-                    case READ_WRITE -> {
-                        var nextIndexPos = this.core.length();
-                        this.core.seek(nextIndexPos);
-                        writer.write(new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE]);
-
-                        var nextSlotPtr = readLinkedArrayListSlot(nextIndexPos, nextKey, (byte) (shift - 1), writeMode, isTopLevel);
-                        slotBlock[i] = slotBlock[i].withSize(nextSlotPtr.leafCount());
-                        var leafCount = blockLeafCount(slotBlock, shift, i);
-                        this.core.seek(slotPos);
-                        writer.write(new LinkedArrayListSlot(nextSlotPtr.leafCount(), new Slot(nextIndexPos, Tag.INDEX)).toBytes());
-                        return new LinkedArrayListSlotPointer(nextSlotPtr.slotPtr(), leafCount);
-                    }
-                    default -> throw new UnreachableException();
-                }
-            }
-            case INDEX -> {
-                var nextPtr = ptr;
-                if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
-                    if (this.txStart != null) {
-                        if (nextPtr < this.txStart) {
-                            // read existing block
-                            this.core.seek(ptr);
-                            var indexBlock = new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE];
-                            reader.readFully(indexBlock);
-                            // copy it to the end
-                            nextPtr = this.core.length();
-                            this.core.seek(nextPtr);
-                            writer.write(indexBlock);
-                        }
-                    } else if (this.header.tag() == Tag.ARRAY_LIST) {
-                        throw new ExpectedTxStartException();
-                    }
-                }
-
-                var nextSlotPtr = readLinkedArrayListSlot(nextPtr, nextKey, (byte) (shift - 1), writeMode, isTopLevel);
-
-                slotBlock[i] = slotBlock[i].withSize(nextSlotPtr.leafCount());
-                var leafCount = blockLeafCount(slotBlock, shift, i);
-
-                if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
-                    // make slot point to block
-                    this.core.seek(slotPos);
-                    writer.write(new LinkedArrayListSlot(nextSlotPtr.leafCount(), new Slot(nextPtr, Tag.INDEX)).toBytes());
-                }
-
-                return new LinkedArrayListSlotPointer(nextSlotPtr.slotPtr(), leafCount);
-            }
-            default -> throw new UnexpectedTagException();
-        }
-    }
-
-    private void readLinkedArrayListBlocks(long indexPos, long key, byte shift, ArrayList<LinkedArrayListBlockInfo> blocks) throws IOException {
-        var reader = this.core.reader();
-
-        var slotBlock = new LinkedArrayListSlot[SLOT_COUNT];
-        {
-            this.core.seek(indexPos);
-            var indexBlock = new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE];
-            reader.readFully(indexBlock);
-
-            var buffer = ByteBuffer.wrap(indexBlock);
-            for (int i = 0; i < slotBlock.length; i++) {
-                var slotBytes = new byte[LinkedArrayListSlot.length];
-                buffer.get(slotBytes);
-                slotBlock[i] = LinkedArrayListSlot.fromBytes(slotBytes);
-            }
-        }
-
-        var keyAndIndex = keyAndIndexForLinkedArrayList(slotBlock, key, shift);
-        if (keyAndIndex == null) throw new NoAvailableSlotsException();
-        var nextKey = keyAndIndex.key;
-        var i = keyAndIndex.index;
-        var leafCount = blockLeafCount(slotBlock, shift, i);
-
-        blocks.add(new LinkedArrayListBlockInfo(slotBlock, i, new LinkedArrayListSlot(leafCount, new Slot(indexPos, Tag.INDEX))));
-
-        if (shift == 0) {
-            return;
-        }
-
-        var slot = slotBlock[i];
-        switch (slot.slot().tag()) {
-            case NONE -> throw new EmptySlotException();
-            case INDEX -> readLinkedArrayListBlocks(slot.slot().value(), nextKey, (byte) (shift - 1), blocks);
-            default -> throw new UnexpectedTagException();
-        }
-    }
-
-    private void populateArray(LinkedArrayListSlot[] arr) {
-        for (int i = 0; i < arr.length; i++) {
-            arr[i] = new LinkedArrayListSlot(0, new Slot());
-        }
-    }
-
-    private LinkedArrayListHeader readLinkedArrayListSlice(LinkedArrayListHeader header, long offset, long size) throws IOException {
-        var writer = this.core.writer();
-
-        if (offset + size > header.size) {
-            throw new KeyNotFoundException();
-        }
-
-        // read the list's left blocks
-        var leftBlocks = new ArrayList<LinkedArrayListBlockInfo>();
-        readLinkedArrayListBlocks(header.ptr, offset, header.shift, leftBlocks);
-
-        // read the list's right blocks
-        var rightBlocks = new ArrayList<LinkedArrayListBlockInfo>();
-        var rightKey = offset + size == 0 ? 0 : offset + size - 1;
-        readLinkedArrayListBlocks(header.ptr, rightKey, header.shift, rightBlocks);
-
-        // create the new blocks
-        var blockCount = leftBlocks.size();
-        var nextSlots = new LinkedArrayListSlot[]{ null, null };
-        byte nextShift = 0;
-        for (int i = 0; i < blockCount; i++) {
-            var isLeafNode = nextSlots[0] == null;
-
-            var leftBlock = leftBlocks.get(blockCount - i - 1);
-            var rightBlock = rightBlocks.get(blockCount - i - 1);
-            var origBlockInfos = new LinkedArrayListBlockInfo[]{
-                leftBlock,
-                rightBlock
-            };
-            var nextBlocks = new LinkedArrayListSlot[][]{ null, null };
-
-            if (leftBlock.parentSlot().slot().value() == rightBlock.parentSlot().slot().value()) {
-                int slotI = 0;
-                var newRootBlock = new LinkedArrayListSlot[SLOT_COUNT];
-                populateArray(newRootBlock);
-                // left slot
-                if (size > 0) {
-                    if (nextSlots[0] != null) {
-                        newRootBlock[slotI] = nextSlots[0];
-                    } else {
-                        newRootBlock[slotI] = leftBlock.block()[leftBlock.i()];
-                    }
-                    slotI += 1;
-                }
-                if (size > 1) {
-                    // middle slots
-                    for (int j = leftBlock.i() + 1; j < rightBlock.i(); j++) {
-                        var middleSlot = leftBlock.block()[j];
-                        newRootBlock[slotI] = middleSlot;
-                        slotI += 1;
-                    }
-
-                    // right slot
-                    if (nextSlots[1] != null) {
-                        newRootBlock[slotI] = nextSlots[1];
-                    } else {
-                        newRootBlock[slotI] = leftBlock.block()[rightBlock.i()];
-                    }
-                }
-                nextBlocks[0] = newRootBlock;
-            } else {
-                int slotI = 0;
-                var newLeftBlock = new LinkedArrayListSlot[SLOT_COUNT];
-                populateArray(newLeftBlock);
-
-                // first slot
-                if (nextSlots[0] != null) {
-                    newLeftBlock[slotI] = nextSlots[0];
-                } else {
-                    newLeftBlock[slotI] = leftBlock.block()[leftBlock.i()];
-                }
-                slotI += 1;
-                // rest of slots
-                for (var j = leftBlock.i() + 1; j < leftBlock.block().length; j++) {
-                    var nextSlot = leftBlock.block()[j];
-                    newLeftBlock[slotI] = nextSlot;
-                    slotI += 1;
-                }
-                nextBlocks[0] = newLeftBlock;
-
-                slotI = 0;
-                var newRightBlock = new LinkedArrayListSlot[SLOT_COUNT];
-                populateArray(newRightBlock);
-                // first slots
-                for (var j = 0; j < rightBlock.i(); j++) {
-                    var firstSlot = rightBlock.block()[j];
-                    newRightBlock[slotI] = firstSlot;
-                    slotI += 1;
-                }
-                // last slot
-                if (nextSlots[1] != null) {
-                    newRightBlock[slotI] = nextSlots[1];
-                } else {
-                    newRightBlock[slotI] = rightBlock.block()[rightBlock.i()];
-                }
-                nextBlocks[1] = newRightBlock;
-
-                nextShift += 1;
-            }
-
-            // clear the next slots
-            nextSlots = new LinkedArrayListSlot[]{ null, null };
-
-            // write the block(s)
-            this.core.seek(this.core.length());
-            for (int j = 0; j < 2; j++) {
-                var blockMaybe = nextBlocks[j];
-                var origBlockInfo = origBlockInfos[j];
-
-                if (blockMaybe != null) {
-                    // determine if the block changed compared to the original block
-                    boolean eql = true;
-                    for (int k = 0; k < blockMaybe.length; k++) {
-                        var blockSlot = blockMaybe[k];
-                        var origSlot = origBlockInfo.block()[k];
-                        if (!blockSlot.slot().equals(origSlot.slot())) {
-                            eql = false;
-                            break;
-                        }
-                    }
-                    // if there is no change, just use the original block
-                    if (eql) {
-                        nextSlots[j] = origBlockInfo.parentSlot();
-                    }
-                    // otherwise make a new block
-                    else {
-                        var nextPtr = this.core.position();
-                        long leafCount = 0;
-                        for (int k = 0; k < blockMaybe.length; k++) {
-                            var blockSlot = blockMaybe[k];
-                            writer.write(blockSlot.toBytes());
-                            if (isLeafNode) {
-                                if (!blockSlot.slot().empty()) {
-                                    leafCount += 1;
-                                }
-                            } else {
-                                leafCount += blockSlot.size();
-                            }
-                        }
-                        nextSlots[j] = new LinkedArrayListSlot(
-                            leafCount,
-                            // only the left side needs to be full,
-                            // because it can have a gap that affects indexing
-                            switch (j) {
-                                // left
-                                case 0 -> new Slot(nextPtr, Tag.INDEX, true);
-                                // right
-                                case 1 -> new Slot(nextPtr, Tag.INDEX);
-                                default -> throw new UnreachableException();
-                            }
-                        );
-                    }
-                }
-            }
-
-            // we found the root node so we can exit
-            if (nextSlots[0] != null && nextSlots[1] == null) {
-                break;
-            }
-        }
-
-        var rootSlot = nextSlots[0];
-        if (rootSlot == null) throw new ExpectedRootNodeException();
-
-        return new LinkedArrayListHeader(nextShift, rootSlot.slot().value(), size);
-    }
-
-    private LinkedArrayListHeader readLinkedArrayListConcat(LinkedArrayListHeader headerA, LinkedArrayListHeader headerB) throws IOException {
-        var writer = this.core.writer();
-
-        // read the first list's blocks
-        var blocksA = new ArrayList<LinkedArrayListBlockInfo>();
-        var keyA = headerA.size() == 0 ? 0 : headerA.size() - 1;
-        readLinkedArrayListBlocks(headerA.ptr(), keyA, headerA.shift(), blocksA);
-
-        // read the second list's blocks
-        var blocksB = new ArrayList<LinkedArrayListBlockInfo>();
-        readLinkedArrayListBlocks(headerB.ptr(), 0, headerB.shift(), blocksB);
-
-        // stitch the blocks together
-        var nextSlots = new LinkedArrayListSlot[]{ null, null };
-        byte nextShift = 0;
-        for (int i = 0; i < Math.max(blocksA.size(), blocksB.size()); i++) {
-            var blockInfos = new LinkedArrayListBlockInfo[]{
-                i < blocksA.size() ? blocksA.get(blocksA.size() - 1 - i) : null,
-                i < blocksB.size() ? blocksB.get(blocksB.size() - 1 - i) : null
-            };
-            var nextBlocks = new LinkedArrayListSlot[][]{ null, null };
-            var isLeafNode = nextSlots[0] == null;
-
-            if (!isLeafNode) {
-                nextShift += 1;
-            }
-
-            for (int j = 0; j < 2; j++) {
-                var blockInfoMaybe = blockInfos[j];
-                if (blockInfoMaybe != null) {
-                    var block = new LinkedArrayListSlot[SLOT_COUNT];
-                    populateArray(block);
-                    int targetI = 0;
-                    for (int sourceI = 0; sourceI < blockInfoMaybe.block().length; sourceI++) {
-                        var blockSlot = blockInfoMaybe.block()[sourceI];
-                        // skip the i'th block if necessary
-                        if (!isLeafNode && blockInfoMaybe.i() == sourceI) {
-                            continue;
-                        }
-                        // break on the first empty slot
-                        else if (blockSlot.slot().empty()) {
-                            break;
-                        }
-                        block[targetI] = blockSlot;
-                        targetI += 1;
-                    }
-
-                    // there are no slots in this block so don't bother writing it
-                    if (targetI == 0) {
-                        continue;
-                    }
-
-                    nextBlocks[j] = block;
-                }
-            }
-
-            var slotsToWrite = new LinkedArrayListSlot[SLOT_COUNT * 2];
-            populateArray(slotsToWrite);
-            int slotI = 0;
-
-            // add the left block
-            if (nextBlocks[0] != null) {
-                for (LinkedArrayListSlot blockSlot : nextBlocks[0]) {
-                    if (blockSlot.slot().empty()) {
-                        break;
-                    }
-                    slotsToWrite[slotI] = blockSlot;
-                    slotI += 1;
-                }
-            }
-
-            // add the center block
-            for (LinkedArrayListSlot slotMaybe : nextSlots) {
-                if (slotMaybe != null) {
-                    slotsToWrite[slotI] = slotMaybe;
-                    slotI += 1;
-                }
-            }
-
-            // add the right block
-            if (nextBlocks[1] != null) {
-                for (LinkedArrayListSlot blockSlot : nextBlocks[1]) {
-                    if (blockSlot.slot().empty()) {
-                        break;
-                    }
-                    slotsToWrite[slotI] = blockSlot;
-                    slotI += 1;
-                }
-            }
-
-            // clear the next slots
-            nextSlots = new LinkedArrayListSlot[]{ null, null };
-
-            // put the slots to write in separate blocks
-            var blocks = new LinkedArrayListSlot[2][SLOT_COUNT];
-            populateArray(blocks[0]);
-            populateArray(blocks[1]);
-            if (slotI > SLOT_COUNT) {
-                // if there are enough slots to fill two blocks,
-                // we need to decide which block to leave the gap in.
-                // if the first list is smaller, leave the gap in
-                // the first block. otherwise, leave it in the second.
-                // this will cause the gap to stay near the left or
-                // right edge of the concatenated list. we do this
-                // because if many gaps form inside the list, the
-                // branches will get long and lead to MaxShiftExceeded.
-                if (headerA.size() < headerB.size()) {
-                    for (int j = 0; j < slotI - SLOT_COUNT; j++) {
-                        blocks[0][j] = slotsToWrite[j];
-                    }
-                    for (int j = 0; j < SLOT_COUNT; j++) {
-                        blocks[1][j] = slotsToWrite[j + (slotI - SLOT_COUNT)];
-                    }
-                } else {
-                    for (int j = 0; j < SLOT_COUNT; j++) {
-                        blocks[0][j] = slotsToWrite[j];
-                    }
-                    for (int j = 0; j < slotI - SLOT_COUNT; j++) {
-                        blocks[1][j] = slotsToWrite[j + SLOT_COUNT];
-                    }
-                }
-            } else {
-                for (int j = 0; j < slotI; j++) {
-                    blocks[0][j] = slotsToWrite[j];
-                }
-            }
-
-            // write the block(s)
-            this.core.seek(this.core.length());
-            for (int blockI = 0; blockI < blocks.length; blockI++) {
-                var block = blocks[blockI];
-
-                // this block is empty so don't bother writing it
-                if (block[0].slot().empty()) {
-                    break;
-                }
-
-                // write the block
-                var nextPtr = this.core.position();
-                long leafCount = 0;
-                for (LinkedArrayListSlot blockSlot : block) {
-                    writer.write(blockSlot.toBytes());
-                    if (isLeafNode) {
-                        if (!blockSlot.slot().empty()) {
-                            leafCount += 1;
-                        }
-                    } else {
-                        leafCount += blockSlot.size();
-                    }
-                }
-
-                nextSlots[blockI] = new LinkedArrayListSlot(leafCount, new Slot(nextPtr, Tag.INDEX, true));
-            }
-        }
-
-        long rootPtr;
-        if (nextSlots[0] != null) {
-            // if there is more than one slot, make a root node
-            if (nextSlots[1] != null) {
-                var block = new LinkedArrayListSlot[SLOT_COUNT];
-                populateArray(block);
-                block[0] = nextSlots[0];
-                block[1] = nextSlots[1];
-
-                // write the root node
-                var newPtr = this.core.length();
-                for (LinkedArrayListSlot blockSlot : block) {
-                    writer.write(blockSlot.toBytes());
-                }
-
-                if (nextShift == MAX_BRANCH_LENGTH) throw new MaxShiftExceededException();
-                nextShift += 1;
-
-                rootPtr = newPtr;
-            }
-            // otherwise the first slot is the root node
-            else {
-                rootPtr = nextSlots[0].slot().value();
-            }
-        }
-        // lists were empty so just re-use existing empty block
-        else {
-            rootPtr = headerA.ptr();
-        }
-
-        return new LinkedArrayListHeader(
-            nextShift,
-            rootPtr,
-            headerA.size() + headerB.size()
-        );
-    }
-
     // compaction helpers
 
     private static Slot remapSlot(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
@@ -2179,7 +2010,7 @@ public class Database {
             case LINKED_ARRAY_LIST -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapLinkedArrayList(sourceCore, targetCore, hashSize, offsetMap, slot);
+                var newOffset = remapBTree(sourceCore, targetCore, hashSize, offsetMap, slot);
                 offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
@@ -2284,73 +2115,96 @@ public class Database {
         return newOffset;
     }
 
-    private static long remapLinkedArrayList(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        // read LinkedArrayListHeader (17 bytes)
+    private static long remapBTree(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
         sourceCore.seek(slot.value());
         var sourceReader = sourceCore.reader();
-        var headerBytes = new byte[LinkedArrayListHeader.length];
+        var headerBytes = new byte[BTreeHeader.length];
         sourceReader.readFully(headerBytes);
-        var header = LinkedArrayListHeader.fromBytes(headerBytes);
+        var header = BTreeHeader.fromBytes(headerBytes);
 
-        // remap root block
-        var remappedPtr = remapLinkedArrayListBlock(sourceCore, targetCore, hashSize, offsetMap, header.ptr());
+        var remappedRoot = remapBTreeNode(sourceCore, targetCore, hashSize, offsetMap, header.rootPtr());
 
-        // write new header
         var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
-        targetWriter.write(new LinkedArrayListHeader(header.shift(), remappedPtr, header.size()).toBytes());
+        targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
 
         return newOffset;
     }
 
-    private static long remapLinkedArrayListBlock(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, long blockOffset) throws Exception {
-        // dedup check
-        var mapped = offsetMap.get(blockOffset);
+    private static long remapBTreeNode(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, long nodeOffset) throws Exception {
+        // dedup check (subtrees are shared by pointer)
+        var mapped = offsetMap.get(nodeOffset);
         if (mapped != null) return mapped;
 
-        // read 272-byte block (16 x LinkedArrayListSlot of 17 bytes)
-        sourceCore.seek(blockOffset);
+        // read the whole node into memory first, so the recursion below can freely
+        // create its own readers/writers
+        sourceCore.seek(nodeOffset);
         var sourceReader = sourceCore.reader();
-        var blockBytes = new byte[LINKED_ARRAY_LIST_INDEX_BLOCK_SIZE];
-        sourceReader.readFully(blockBytes);
+        var nodeHeader = new byte[BTREE_NODE_HEADER_SIZE];
+        sourceReader.readFully(nodeHeader);
+        var kindInt = nodeHeader[0] & 0xFF;
+        if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+        var kind = BTreeNodeKind.values()[kindInt];
+        var num = nodeHeader[1] & 0xFF;
 
-        // parse slots
-        var buffer = ByteBuffer.wrap(blockBytes);
-        var slots = new LinkedArrayListSlot[SLOT_COUNT];
-        for (int i = 0; i < SLOT_COUNT; i++) {
-            var slotBytes = new byte[LinkedArrayListSlot.length];
-            buffer.get(slotBytes);
-            slots[i] = LinkedArrayListSlot.fromBytes(slotBytes);
-        }
+        switch (kind) {
+            case LEAF -> {
+                var body = new byte[Slot.length * BTREE_SLOT_COUNT];
+                sourceReader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
 
-        // remap each slot
-        var remappedSlots = new LinkedArrayListSlot[SLOT_COUNT];
-        for (int i = 0; i < SLOT_COUNT; i++) {
-            var s = slots[i];
-            if (s.slot().tag() == Tag.INDEX) {
-                // index slots point to other 272-byte blocks, recurse on ourselves
-                var remappedPtr = remapLinkedArrayListBlock(sourceCore, targetCore, hashSize, offsetMap, s.slot().value());
-                remappedSlots[i] = new LinkedArrayListSlot(s.size(), new Slot(remappedPtr, Tag.INDEX, s.slot().full()));
-            } else if (s.slot().empty()) {
-                remappedSlots[i] = s;
-            } else {
-                // leaf slot - remap via remapSlot
-                var remapped = remapSlot(sourceCore, targetCore, hashSize, offsetMap, s.slot());
-                remappedSlots[i] = new LinkedArrayListSlot(s.size(), remapped);
+                var slots = new Slot[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    var valueSlot = Slot.fromBytes(slotBytes);
+                    slots[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, valueSlot);
+                }
+
+                var newOffset = targetCore.length();
+                targetCore.seek(newOffset);
+                var targetWriter = targetCore.writer();
+                targetWriter.writeByte(kindInt);
+                targetWriter.writeByte(num);
+                for (var s : slots) targetWriter.write(s.toBytes());
+
+                offsetMap.put(nodeOffset, newOffset);
+                return newOffset;
+            }
+            case BRANCH -> {
+                var body = new byte[(Slot.length + 8) * BTREE_SLOT_COUNT];
+                sourceReader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+
+                var children = new Slot[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    var child = Slot.fromBytes(slotBytes);
+                    if (child.tag() == Tag.INDEX) {
+                        var remappedPtr = remapBTreeNode(sourceCore, targetCore, hashSize, offsetMap, child.value());
+                        children[i] = new Slot(remappedPtr, Tag.INDEX, child.full());
+                    } else {
+                        children[i] = child;
+                    }
+                }
+                var counts = new long[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
+
+                var newOffset = targetCore.length();
+                targetCore.seek(newOffset);
+                var targetWriter = targetCore.writer();
+                targetWriter.writeByte(kindInt);
+                targetWriter.writeByte(num);
+                for (var s : children) targetWriter.write(s.toBytes());
+                for (var c : counts) targetWriter.writeLong(c);
+
+                offsetMap.put(nodeOffset, newOffset);
+                return newOffset;
             }
         }
-
-        // write remapped block to target
-        var newOffset = targetCore.length();
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        for (var s : remappedSlots) {
-            targetWriter.write(s.toBytes());
-        }
-
-        offsetMap.put(blockOffset, newOffset);
-        return newOffset;
+        throw new UnreachableException();
     }
 
     private static long remapHashMapOrSet(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot, boolean counted) throws Exception {
