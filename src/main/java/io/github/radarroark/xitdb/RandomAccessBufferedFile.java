@@ -91,6 +91,11 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
             this.memory.seek((int) (this.filePos - this.memoryPos));
             this.memory.write(buffer);
         } else {
+            // a direct disk write that overlaps the buffered region would be
+            // clobbered by a later flush of stale buffer bytes, so flush first
+            if (this.filePos < this.memoryPos + this.memory.size() && this.filePos + buffer.length > this.memoryPos) {
+                this.flush();
+            }
             this.file.seek(this.filePos);
             this.file.write(buffer);
         }
