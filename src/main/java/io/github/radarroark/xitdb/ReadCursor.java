@@ -206,7 +206,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 var header = Database.ArrayListHeader.fromBytes(headerBytes);
                 return header.size();
             }
-            case LINKED_ARRAY_LIST -> {
+            case LINKED_ARRAY_LIST, SORTED_MAP, SORTED_SET -> {
                 this.db.core.seek(this.slotPtr.slot().value());
                 var headerBytes = new byte[Database.BTreeHeader.length];
                 reader.readFully(headerBytes);
@@ -357,6 +357,101 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             }
         }
 
+        private Iterator(ReadCursor cursor, long size, long index, Stack<Level> stack) {
+            this.cursor = cursor;
+            this.size = size;
+            this.index = index;
+            this.stack = stack;
+        }
+
+        // start a sorted-map iterator at the entry with rank startIndex (the count
+        // descent), iterating in key order from there
+        public static Iterator initSortedFromIndex(ReadCursor cursor, long startIndex) throws IOException {
+            var total = cursor.count();
+            // an unwritten map is NONE (like iterator()): yield nothing
+            if (cursor.slotPtr.slot().tag() == Tag.NONE || startIndex >= total) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            var rootPtr = sortedRootPtr(cursor);
+            return new Iterator(cursor, total, startIndex, sortedStackFromIndex(cursor, rootPtr, startIndex));
+        }
+
+        // start a sorted-map iterator at the first entry with key >= startKey
+        public static Iterator initSortedFromKey(ReadCursor cursor, byte[] startKey) throws IOException {
+            if (cursor.slotPtr.slot().tag() == Tag.NONE) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            var total = cursor.count();
+            var rootPtr = sortedRootPtr(cursor);
+            var built = sortedStackFromKey(cursor, rootPtr, startKey);
+            return new Iterator(cursor, total, built.before(), built.stack());
+        }
+
+        private static long sortedRootPtr(ReadCursor cursor) throws IOException {
+            switch (cursor.slotPtr.slot().tag()) {
+                case SORTED_MAP, SORTED_SET -> {}
+                default -> throw new Database.UnexpectedTagException();
+            }
+            cursor.db.core.seek(cursor.slotPtr.slot().value());
+            var reader = cursor.db.core.reader();
+            var headerBytes = new byte[Database.BTreeHeader.length];
+            reader.readFully(headerBytes);
+            var header = Database.BTreeHeader.fromBytes(headerBytes);
+            return header.rootPtr();
+        }
+
+        private static Stack<Level> sortedStackFromIndex(ReadCursor cursor, long rootPtr, long startIndex) throws IOException {
+            var stack = new Stack<Level>();
+            var nodePtr = rootPtr;
+            var rem = startIndex;
+            while (true) {
+                var node = cursor.db.readSortedNode(nodePtr);
+                var position = nodePtr + Database.BTREE_NODE_HEADER_SIZE;
+                switch (node.kind) {
+                    case LEAF -> {
+                        stack.add(new Level(position, node.entries, (byte) rem));
+                        return stack;
+                    }
+                    case BRANCH -> {
+                        int i = 0;
+                        while (i + 1 < node.num && rem >= node.counts[i]) { rem -= node.counts[i]; i++; }
+                        stack.add(new Level(position, node.children, (byte) i));
+                        nodePtr = node.children[i].value();
+                    }
+                }
+            }
+        }
+
+        private static record SortedStackResult(Stack<Level> stack, long before) {}
+
+        private static SortedStackResult sortedStackFromKey(ReadCursor cursor, long rootPtr, byte[] key) throws IOException {
+            var stack = new Stack<Level>();
+            var nodePtr = rootPtr;
+            long before = 0;
+            while (true) {
+                var node = cursor.db.readSortedNode(nodePtr);
+                var position = nodePtr + Database.BTREE_NODE_HEADER_SIZE;
+                switch (node.kind) {
+                    case LEAF -> {
+                        int li = node.num;
+                        for (int j = 0; j < node.num; j++) {
+                            var kv = cursor.db.readKvPair(node.entries[j]);
+                            if (cursor.db.compareKey(kv.keySlot(), key) >= 0) { li = j; break; }
+                        }
+                        before += li;
+                        stack.add(new Level(position, node.entries, (byte) li));
+                        return new SortedStackResult(stack, before);
+                    }
+                    case BRANCH -> {
+                        int i = 0;
+                        while (i + 1 < node.num && cursor.db.compareKey(node.separators[i + 1], key) <= 0) { before += node.counts[i]; i++; }
+                        stack.add(new Level(position, node.children, (byte) i));
+                        nodePtr = node.children[i].value();
+                    }
+                }
+            }
+        }
+
         public Iterator(ReadCursor cursor) throws IOException {
             this.cursor = cursor;
             switch (cursor.slotPtr.slot().tag()) {
@@ -376,7 +471,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                     this.index = 0;
                     this.stack = initStack(cursor, header.ptr());
                 }
-                case LINKED_ARRAY_LIST -> {
+                case LINKED_ARRAY_LIST, SORTED_MAP, SORTED_SET -> {
                     // backed by a b-tree: read the header, then walk from the root
                     // node's value/child slots (skipping its kind+num header)
                     var position = cursor.slotPtr.slot().value();
@@ -408,7 +503,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             return switch (this.cursor.slotPtr.slot().tag()) {
                 case NONE -> false;
                 case ARRAY_LIST -> this.index < this.size;
-                case LINKED_ARRAY_LIST -> this.index < this.size;
+                case LINKED_ARRAY_LIST, SORTED_MAP, SORTED_SET -> this.index < this.size;
                 case HASH_MAP, HASH_SET, COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
                     // the only way to determine if there's another value in the
                     // hash map is to try to retrieve it, so we store it in a
@@ -438,7 +533,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                         this.index += 1;
                         return nextInternal(0);
                     }
-                    case LINKED_ARRAY_LIST -> {
+                    case LINKED_ARRAY_LIST, SORTED_MAP, SORTED_SET -> {
                         if (!hasNext()) return null;
                         this.index += 1;
                         // b-tree nodes have a kind+num header before their slots,

@@ -1012,6 +1012,17 @@ class HighLevelDatabaseTest {
                     var cset = new WriteCountedHashSet(csetCursor);
                     cset.put("p");
                     cset.put("q");
+
+                    // SortedMap
+                    var sorted = new WriteSortedMap(moment.putCursor("sorted"));
+                    sorted.put("apple", new Database.Uint(1));
+                    sorted.put("banana", new Database.Uint(2));
+                    sorted.put("cherry", new Database.Uint(3));
+
+                    // SortedSet
+                    var sortedSet = new WriteSortedSet(moment.putCursor("sortedset"));
+                    sortedSet.put("foo");
+                    sortedSet.put("bar");
                 });
             }
 
@@ -1093,6 +1104,21 @@ class HighLevelDatabaseTest {
             var cset = new ReadCountedHashSet(csetCursor);
             assertEquals(2, cset.count());
             assertEquals("p", new String(cset.getCursor("p").readBytes(MAX_READ_BYTES)));
+
+            // SortedMap
+            var sorted = new ReadSortedMap(moment.getCursor("sorted"));
+            assertEquals(3, sorted.count());
+            assertEquals(2, sorted.getCursor("banana").readUint());
+            // lexicographic order is preserved across compaction
+            assertEquals("apple", new String(sorted.getIndexKeyValuePair(0).keyCursor.readBytes(MAX_READ_BYTES)));
+            assertEquals("cherry", new String(sorted.getIndexKeyValuePair(-1).keyCursor.readBytes(MAX_READ_BYTES)));
+
+            // SortedSet
+            var sortedSet = new ReadSortedSet(moment.getCursor("sortedset"));
+            assertEquals(2, sortedSet.count());
+            assertTrue(sortedSet.contains("foo"));
+            assertTrue(sortedSet.contains("bar"));
+            assertTrue(!sortedSet.contains("baz"));
         }
 
         // structural sharing (most data shared, only 1 key changes per moment)
@@ -1218,6 +1244,214 @@ class HighLevelDatabaseTest {
                 // original data should still be in moment 1 (inherited)
                 assertEquals("original_data", new String(m1.getCursor("original").readBytes(MAX_READ_BYTES)));
             }
+        }
+    }
+
+    @Test
+    void testSortedMap() throws Exception {
+        try (var ram = new RandomAccessMemory()) {
+            var core = new CoreMemory(ram);
+            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+            testSortedMap(core, hasher);
+        }
+
+        {
+            var file = File.createTempFile("database", "");
+            file.deleteOnExit();
+            try (var raf = new RandomAccessFile(file, "rw")) {
+                var core = new CoreFile(raf);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testSortedMap(core, hasher);
+            }
+        }
+
+        {
+            var file = File.createTempFile("database", "");
+            file.deleteOnExit();
+            try (var raf = new RandomAccessBufferedFile(file, "rw")) {
+                var core = new CoreBufferedFile(raf);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testSortedMap(core, hasher);
+            }
+        }
+    }
+
+    void testSortedMap(Core core, Hasher hasher) throws Exception {
+        var db = new Database(core, hasher);
+        var rootCursor = db.rootCursor();
+
+        // keys "k0000".."k0059" sort lexicographically in numeric order
+        final int COUNT = 60;
+
+        rootCursor.writePath(new Database.PathPart[]{
+            new Database.ArrayListInit(),
+            new Database.ArrayListAppend(),
+            new Database.HashMapInit(),
+            new Database.Context((cursor) -> {
+                var moment = new WriteHashMap(cursor);
+                var map = new WriteSortedMap(moment.putCursor("map"));
+
+                // insert in reverse order to exercise front-insertions and splits
+                for (int i = COUNT; i > 0;) {
+                    i -= 1;
+                    map.put(String.format("k%04d", i), new Database.Uint(i));
+                }
+                assertEquals(COUNT, map.count());
+
+                // dedup: re-putting an existing key replaces the value, not the count
+                map.put("k0005", new Database.Uint(999));
+                assertEquals(COUNT, map.count());
+                assertEquals(999, map.getCursor("k0005").readUint());
+                map.put("k0005", new Database.Uint(5));
+
+                // ordered iteration yields k0000..k0059 in order with intact values
+                {
+                    int n = 0;
+                    var iter = map.iterator();
+                    while (iter.hasNext()) {
+                        var kv = iter.next().readKeyValuePair();
+                        assertEquals(String.format("k%04d", n), new String(kv.keyCursor.readBytes(MAX_READ_BYTES)));
+                        assertEquals(n, kv.valueCursor.readUint());
+                        n += 1;
+                    }
+                    assertEquals(COUNT, n);
+                }
+
+                assertTrue(map.getCursor("k0042") != null);
+                assertTrue(map.getCursor("nope") == null);
+
+                // getByIndex (positive and negative) and rank are inverses
+                {
+                    for (int idx = 0; idx < COUNT; idx++) {
+                        var kv = map.getIndexKeyValuePair(idx);
+                        var key = new String(kv.keyCursor.readBytes(MAX_READ_BYTES));
+                        assertEquals(String.format("k%04d", idx), key);
+                        assertEquals(idx, map.rank(key));
+                    }
+                    var last = map.getIndexKeyValuePair(-1);
+                    assertEquals("k0059", new String(last.keyCursor.readBytes(MAX_READ_BYTES)));
+                    assertEquals(null, map.getIndexKeyValuePair(COUNT));
+                }
+
+                // lower-bound iteration from a present and an absent key
+                {
+                    var iter = map.iteratorFrom("k0030");
+                    assertEquals("k0030", new String(iter.next().readKeyValuePair().keyCursor.readBytes(MAX_READ_BYTES)));
+                }
+                {
+                    // "k00095" sorts between "k0009" and "k0010"
+                    var iter = map.iteratorFrom("k00095");
+                    assertEquals("k0010", new String(iter.next().readKeyValuePair().keyCursor.readBytes(MAX_READ_BYTES)));
+                }
+                {
+                    var iter = map.iteratorFromIndex(COUNT - 2);
+                    assertEquals("k0058", new String(iter.next().readKeyValuePair().keyCursor.readBytes(MAX_READ_BYTES)));
+                }
+
+                // remove the even keys, then re-verify order, count, and presence
+                {
+                    for (int j = 0; j < COUNT; j += 2) {
+                        assertTrue(map.remove(String.format("k%04d", j)));
+                    }
+                    assertEquals(COUNT / 2, map.count());
+                    assertTrue(!map.remove("k0000")); // already gone
+
+                    int expectI = 1;
+                    int seen = 0;
+                    var iter = map.iterator();
+                    while (iter.hasNext()) {
+                        var kv = iter.next().readKeyValuePair();
+                        assertEquals(String.format("k%04d", expectI), new String(kv.keyCursor.readBytes(MAX_READ_BYTES)));
+                        expectI += 2;
+                        seen += 1;
+                    }
+                    assertEquals(COUNT / 2, seen);
+                }
+
+                // iterating-from on an unwritten (none) map yields nothing, like iterator()
+                {
+                    var noneCursor = new ReadCursor(new SlotPointer(null, new Slot()), db);
+                    var empty = new ReadSortedMap(noneCursor);
+                    assertTrue(!empty.iteratorFrom("anything").hasNext());
+                    assertTrue(!empty.iteratorFromIndex(0).hasNext());
+                }
+
+                // SortedSet with mixed short (inline) and long (external) keys
+                var set = new WriteSortedSet(moment.putCursor("set"));
+                set.put("short");
+                set.put("a-much-longer-key-stored-externally");
+                set.put("mid");
+                set.put("short"); // dup is a no-op
+                assertEquals(3, set.count());
+                assertTrue(set.contains("mid"));
+                assertTrue(!set.contains("nope"));
+                {
+                    var want = new String[]{ "a-much-longer-key-stored-externally", "mid", "short" };
+                    int n = 0;
+                    var iter = set.iterator();
+                    while (iter.hasNext()) {
+                        var kv = iter.next().readKeyValuePair();
+                        assertEquals(want[n], new String(kv.keyCursor.readBytes(MAX_READ_BYTES)));
+                        n += 1;
+                    }
+                    assertEquals(3, n);
+                }
+                assertTrue(set.remove("mid"));
+                assertEquals(2, set.count());
+
+                // immutability guards: positional access is read-only, and keys/entries
+                // cannot be overwritten through the low-level path API
+                assertThrows(Database.WriteNotAllowedException.class, () -> {
+                    ((WriteCursor)map.cursor).writePath(new Database.PathPart[]{
+                        new Database.SortedMapGetIndex(0)
+                    });
+                });
+                assertThrows(Database.CursorNotWriteableException.class, () -> {
+                    ((WriteCursor)map.cursor).writePath(new Database.PathPart[]{
+                        new Database.SortedMapGet(new Database.SortedMapGetKey("k0001".getBytes())),
+                        new Database.WriteData(new Database.Bytes("x"))
+                    });
+                });
+            })
+        });
+
+        // the map persists in the committed moment
+        {
+            var history = new ReadArrayList(db.rootCursor());
+            var moment = new ReadHashMap(history.getCursor(-1));
+            var map = new ReadSortedMap(moment.getCursor("map"));
+            assertEquals(COUNT / 2, map.count());
+            assertEquals("k0001", new String(map.getIndexKeyValuePair(0).keyCursor.readBytes(MAX_READ_BYTES)));
+        }
+
+        // a second moment that inherits and mutates the map must not disturb the first
+        // (copy-on-write immutability across transactions)
+        rootCursor.writePath(new Database.PathPart[]{
+            new Database.ArrayListInit(),
+            new Database.ArrayListAppend(),
+            new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
+            new Database.HashMapInit(),
+            new Database.Context((cursor) -> {
+                var moment = new WriteHashMap(cursor);
+                var map = new WriteSortedMap(moment.putCursor("map"));
+                assertTrue(map.remove("k0001"));
+                map.put("k0001", new Database.Uint(7)); // not in moment 0
+            })
+        });
+        {
+            var history = new ReadArrayList(db.rootCursor());
+
+            // moment 0 (original) is unchanged: k0001 still present with value 1
+            var m0 = new ReadHashMap(history.getCursor(0));
+            var map0 = new ReadSortedMap(m0.getCursor("map"));
+            assertEquals(COUNT / 2, map0.count());
+            assertEquals(1, map0.getCursor("k0001").readUint());
+
+            // moment 1 reflects the mutation: k0001 re-added with value 7
+            var m1 = new ReadHashMap(history.getCursor(1));
+            var map1 = new ReadSortedMap(m1.getCursor("map"));
+            assertEquals(COUNT / 2, map1.count());
+            assertEquals(7, map1.getCursor("k0001").readUint());
         }
     }
 }

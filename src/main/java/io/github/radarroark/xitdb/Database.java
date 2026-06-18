@@ -34,6 +34,11 @@ public class Database {
     public static final int BTREE_NODE_HEADER_SIZE = 2;
     public static final int BTREE_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
     public static final int BTREE_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (Slot.length + 8) * BTREE_SLOT_COUNT;
+    // sorted_map / sorted_set node block: [kind: u8][num: u8] followed by, for a
+    // leaf, BTREE_SLOT_COUNT .kv_pair slots; for a branch, BTREE_SLOT_COUNT child
+    // slots, then BTREE_SLOT_COUNT separator slots, then BTREE_SLOT_COUNT u64 counts
+    public static final int SORTED_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
+    public static final int SORTED_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (Slot.length * 2 + 8) * BTREE_SLOT_COUNT;
 
     public static enum WriteMode {
         READ_ONLY,
@@ -380,7 +385,55 @@ public class Database {
 
     public static record BTreeSplitResult(long left, long right) {}
 
-    public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, WriteData, Context {
+    // sorted_map / sorted_set: a count-augmented B+tree keyed on arbitrary byte
+    // strings, ordered lexicographically. reuses the b-tree's capacity constants,
+    // persistence model (txStart reuse), KeyValuePair entries, and the BTreeHeader
+    // {rootPtr, size} header. a leaf holds .kv_pair entries in ascending key order;
+    // a branch holds child slots, separator slots (the smallest key in each child's
+    // subtree; separators[0] is an unused sentinel), and per-child subtree counts.
+    public static final class SortedNode {
+        public BTreeNodeKind kind;
+        public int num;
+        public Slot[] entries = new Slot[BTREE_SLOT_COUNT];    // leaf
+        public Slot[] children = new Slot[BTREE_SLOT_COUNT];   // branch
+        public Slot[] separators = new Slot[BTREE_SLOT_COUNT]; // branch
+        public long[] counts = new long[BTREE_SLOT_COUNT];     // branch
+
+        public SortedNode(BTreeNodeKind kind, int num) {
+            this.kind = kind;
+            this.num = num;
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                this.entries[i] = new Slot();
+                this.children[i] = new Slot();
+                this.separators[i] = new Slot();
+            }
+        }
+
+        public long subtreeCount() {
+            if (this.kind == BTreeNodeKind.LEAF) return this.num;
+            long total = 0;
+            for (int i = 0; i < this.num; i++) total += this.counts[i];
+            return total;
+        }
+    }
+
+    // the new right sibling produced when a node splits
+    public static record SortedSplit(long nodePtr, long count, Slot separator) {}
+
+    // insert/replace result: where to write the value, whether a new entry was added
+    // (vs replacing), and the new right sibling if this node split
+    public static record SortedInsertResult(long nodePtr, long count, long valuePosition, boolean added, SortedSplit split) {}
+
+    // remove result threaded back up the descent: the rewritten node and whether the
+    // key was found. separators are stable lower-bound boundaries (not exact mins), so
+    // deletions never refresh them; an emptied leaf is left in place.
+    public static record SortedRemoveResult(long nodePtr, boolean found) {}
+
+    public static record SortedSlot(Slot slot, long position) {}
+
+    public static record SortedEntry(Slot kvSlot, Slot keySlot, long valuePosition) {}
+
+    public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, SortedMapInit, SortedMapGet, SortedMapGetIndex, SortedMapRemove, WriteData, Context {
         public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception;
     }
 
@@ -996,6 +1049,156 @@ public class Database {
         }
     }
 
+    public static record SortedMapInit(boolean set) implements PathPart {
+        public SortedMapInit() {
+            this(false);
+        }
+
+        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+            if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
+            if (isTopLevel) throw new InvalidTopLevelTypeException();
+            if (slotPtr.position() == null) throw new CursorNotWriteableException();
+            long position = slotPtr.position();
+            Tag tag = this.set() ? Tag.SORTED_SET : Tag.SORTED_MAP;
+            var writer = db.core.writer();
+            switch (slotPtr.slot().tag()) {
+                case NONE -> {
+                    var rootPtr = db.writeSortedNode(new SortedNode(BTreeNodeKind.LEAF, 0));
+                    var headerPtr = db.core.length();
+                    db.core.seek(headerPtr);
+                    writer.write(new BTreeHeader(rootPtr, 0).toBytes());
+                    var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, tag));
+                    db.core.seek(position);
+                    writer.write(nextSlotPtr.slot().toBytes());
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                }
+                case SORTED_MAP, SORTED_SET -> {
+                    if (slotPtr.slot().tag() != tag) throw new UnexpectedTagException();
+                    var headerPtr = slotPtr.slot().value();
+                    // copy the header into this transaction unless it was made in it
+                    if (db.txStart != null) {
+                        if (headerPtr < db.txStart) {
+                            var reader = db.core.reader();
+                            db.core.seek(headerPtr);
+                            var headerBytes = new byte[BTreeHeader.length];
+                            reader.readFully(headerBytes);
+                            headerPtr = db.core.length();
+                            db.core.seek(headerPtr);
+                            writer.write(headerBytes);
+                        }
+                    } else if (db.header.tag == Tag.ARRAY_LIST) {
+                        throw new ExpectedTxStartException();
+                    }
+                    var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, tag));
+                    db.core.seek(position);
+                    writer.write(nextSlotPtr.slot().toBytes());
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                }
+                default -> throw new UnexpectedTagException();
+            }
+        }
+    }
+
+    public static record SortedMapGet(SortedMapGetTarget target) implements PathPart {
+        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+            switch (slotPtr.slot().tag()) {
+                case NONE -> throw new KeyNotFoundException();
+                case SORTED_MAP, SORTED_SET -> {}
+                default -> throw new UnexpectedTagException();
+            }
+
+            byte[] key;
+            if (this.target() instanceof SortedMapGetKVPair t) key = t.key();
+            else if (this.target() instanceof SortedMapGetKey t) key = t.key();
+            else if (this.target() instanceof SortedMapGetValue t) key = t.key();
+            else throw new IllegalArgumentException();
+
+            var headerPtr = slotPtr.slot().value();
+            var reader = db.core.reader();
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
+            reader.readFully(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
+
+            if (writeMode == WriteMode.READ_ONLY) {
+                var found = db.sortedGet(header.rootPtr(), key);
+                if (found == null) throw new KeyNotFoundException();
+                var targetSlot = db.sortedTargetSlot(found.slot().value(), this.target());
+                return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
+            } else {
+                var result = db.sortedPut(header.rootPtr(), key);
+                var newRootPtr = db.sortedGrowRoot(result);
+                var kvPos = result.valuePosition() - db.header.hashSize() - Slot.length;
+                var targetSlot = db.sortedTargetSlot(kvPos, this.target());
+                var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
+
+                var writer = db.core.writer();
+                db.core.seek(headerPtr);
+                writer.write(new BTreeHeader(newRootPtr, header.size() + (result.added() ? 1 : 0)).toBytes());
+
+                return finalSlotPtr;
+            }
+        }
+    }
+
+    public static record SortedMapGetIndex(long index) implements PathPart {
+        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+            if (writeMode == WriteMode.READ_WRITE) throw new WriteNotAllowedException();
+
+            switch (slotPtr.slot().tag()) {
+                case NONE -> throw new KeyNotFoundException();
+                case SORTED_MAP, SORTED_SET -> {}
+                default -> throw new UnexpectedTagException();
+            }
+
+            var headerPtr = slotPtr.slot().value();
+            var reader = db.core.reader();
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
+            reader.readFully(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
+
+            var index = this.index();
+            if (index >= header.size() || index < -header.size()) {
+                throw new KeyNotFoundException();
+            }
+            var rank = index < 0 ? header.size() - Math.abs(index) : index;
+
+            var found = db.sortedGetByIndex(header.rootPtr(), rank);
+            // return the kv_pair entry so the caller can read key and value
+            var targetSlot = new SlotPointer(found.position(), found.slot());
+            return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
+        }
+    }
+
+    public static record SortedMapRemove(byte[] key) implements PathPart {
+        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+            if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
+
+            switch (slotPtr.slot().tag()) {
+                case NONE -> throw new KeyNotFoundException();
+                case SORTED_MAP, SORTED_SET -> {}
+                default -> throw new UnexpectedTagException();
+            }
+
+            var headerPtr = slotPtr.slot().value();
+            var reader = db.core.reader();
+            db.core.seek(headerPtr);
+            var headerBytes = new byte[BTreeHeader.length];
+            reader.readFully(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
+
+            var result = db.sortedRemove(header.rootPtr(), this.key());
+            if (!result.found()) throw new KeyNotFoundException();
+
+            var writer = db.core.writer();
+            db.core.seek(headerPtr);
+            writer.write(new BTreeHeader(result.nodePtr(), header.size() - 1).toBytes());
+
+            return slotPtr;
+        }
+    }
+
     public static record WriteData(WriteableData data) implements PathPart {
         public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
@@ -1088,6 +1291,11 @@ public class Database {
     public static record HashMapGetKVPair(byte[] hash) implements HashMapGetTarget {}
     public static record HashMapGetKey(byte[] hash) implements HashMapGetTarget {}
     public static record HashMapGetValue(byte[] hash) implements HashMapGetTarget {}
+
+    public static sealed interface SortedMapGetTarget permits SortedMapGetKVPair, SortedMapGetKey, SortedMapGetValue {}
+    public static record SortedMapGetKVPair(byte[] key) implements SortedMapGetTarget {}
+    public static record SortedMapGetKey(byte[] key) implements SortedMapGetTarget {}
+    public static record SortedMapGetValue(byte[] key) implements SortedMapGetTarget {}
 
     public static sealed interface WriteableData permits Slot, Uint, Int, Float, Bytes {}
     public static record Uint(long value) implements WriteableData {}
@@ -1979,6 +2187,436 @@ public class Database {
         }
     }
 
+    // sorted_map / sorted_set
+
+    SortedNode readSortedNode(long ptr) throws IOException {
+        this.core.seek(ptr);
+        var reader = this.core.reader();
+        var headerBytes = new byte[BTREE_NODE_HEADER_SIZE];
+        reader.readFully(headerBytes);
+        var kindInt = headerBytes[0] & 0xFF;
+        if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+        var kind = BTreeNodeKind.values()[kindInt];
+        var num = headerBytes[1] & 0xFF;
+        if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
+        var node = new SortedNode(kind, num);
+        switch (kind) {
+            case LEAF -> {
+                var body = new byte[Slot.length * BTREE_SLOT_COUNT];
+                reader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    node.entries[i] = Slot.fromBytes(slotBytes);
+                }
+            }
+            case BRANCH -> {
+                var body = new byte[(Slot.length * 2 + 8) * BTREE_SLOT_COUNT];
+                reader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    node.children[i] = Slot.fromBytes(slotBytes);
+                }
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    node.separators[i] = Slot.fromBytes(slotBytes);
+                }
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    node.counts[i] = buffer.getLong();
+                }
+            }
+        }
+        return node;
+    }
+
+    private void writeSortedNodeAt(SortedNode node, long ptr) throws IOException {
+        this.core.seek(ptr);
+        var writer = this.core.writer();
+        int bodySize = node.kind == BTreeNodeKind.LEAF
+            ? SORTED_LEAF_BLOCK_SIZE
+            : SORTED_BRANCH_BLOCK_SIZE;
+        var buffer = ByteBuffer.allocate(bodySize);
+        buffer.put((byte) node.kind.ordinal());
+        buffer.put((byte) node.num);
+        switch (node.kind) {
+            case LEAF -> {
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.put(node.entries[i].toBytes());
+            }
+            case BRANCH -> {
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.put(node.children[i].toBytes());
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.put(node.separators[i].toBytes());
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) buffer.putLong(node.counts[i]);
+            }
+        }
+        writer.write(buffer.array());
+    }
+
+    private long writeSortedNode(SortedNode node) throws IOException {
+        var ptr = this.core.length();
+        writeSortedNodeAt(node, ptr);
+        return ptr;
+    }
+
+    // reuse oldPtr's position in place when it belongs to this transaction
+    // (mirrors btreeWriteNode / the txStart path-copying model)
+    private long sortedWriteNode(SortedNode node, long oldPtr) throws IOException {
+        if (btreeReusable(oldPtr)) {
+            writeSortedNodeAt(node, oldPtr);
+            return oldPtr;
+        }
+        return writeSortedNode(node);
+    }
+
+    KeyValuePair readKvPair(Slot kvSlot) throws IOException {
+        if (kvSlot.tag() != Tag.KV_PAIR) throw new UnexpectedTagException();
+        this.core.seek(kvSlot.value());
+        var reader = this.core.reader();
+        var bytes = new byte[KeyValuePair.length(this.header.hashSize())];
+        reader.readFully(bytes);
+        return KeyValuePair.fromBytes(bytes, this.header.hashSize());
+    }
+
+    // lexicographic comparison of the byte key stored at keySlot (a bytes or
+    // short_bytes slot) against the in-memory target. returns <0, 0, or >0. streams
+    // external bytes so keys of any length work without allocation.
+    int compareKey(Slot keySlot, byte[] target) throws IOException {
+        switch (keySlot.tag()) {
+            case SHORT_BYTES -> {
+                var buf = ByteBuffer.allocate(8);
+                buf.putLong(keySlot.value());
+                var bytes = buf.array();
+                int total = keySlot.full() ? 6 : 8;
+                int len = total;
+                for (int i = 0; i < total; i++) {
+                    if (bytes[i] == 0) { len = i; break; }
+                }
+                return Arrays.compareUnsigned(Arrays.copyOf(bytes, len), target);
+            }
+            case BYTES -> {
+                var reader = this.core.reader();
+                this.core.seek(keySlot.value());
+                long len = reader.readLong();
+                long i = 0;
+                var chunk = new byte[256];
+                while (i < len) {
+                    int n = (int) Math.min(chunk.length, len - i);
+                    reader.readFully(chunk, 0, n);
+                    for (int j = 0; j < n; j++) {
+                        long ti = i + j;
+                        if (ti >= target.length) return 1; // stored has more, equal so far
+                        int b = chunk[j] & 0xFF;
+                        int t = target[(int) ti] & 0xFF;
+                        if (b < t) return -1;
+                        if (b > t) return 1;
+                    }
+                    i += n;
+                }
+                return target.length > len ? -1 : 0;
+            }
+            default -> throw new UnexpectedTagException();
+        }
+    }
+
+    // descend by key to the matching leaf entry (the .kv_pair slot), or null
+    private SortedSlot sortedGet(long rootPtr, byte[] key) throws IOException {
+        var nodePtr = rootPtr;
+        while (true) {
+            var node = readSortedNode(nodePtr);
+            switch (node.kind) {
+                case LEAF -> {
+                    for (int i = 0; i < node.num; i++) {
+                        var entry = node.entries[i];
+                        var kv = readKvPair(entry);
+                        int cmp = compareKey(kv.keySlot(), key);
+                        if (cmp == 0) return new SortedSlot(entry, nodePtr + BTREE_NODE_HEADER_SIZE + (long) i * Slot.length);
+                        if (cmp > 0) return null;
+                    }
+                    return null;
+                }
+                case BRANCH -> {
+                    int i = 0;
+                    while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
+                    nodePtr = node.children[i].value();
+                }
+            }
+        }
+    }
+
+    // descend by rank to the leaf entry at the given 0-based index
+    private SortedSlot sortedGetByIndex(long rootPtr, long rank) throws IOException {
+        var nodePtr = rootPtr;
+        var rem = rank;
+        while (true) {
+            var node = readSortedNode(nodePtr);
+            switch (node.kind) {
+                case LEAF -> {
+                    int i = (int) rem;
+                    return new SortedSlot(node.entries[i], nodePtr + BTREE_NODE_HEADER_SIZE + (long) i * Slot.length);
+                }
+                case BRANCH -> {
+                    int i = 0;
+                    while (i + 1 < node.num && rem >= node.counts[i]) { rem -= node.counts[i]; i++; }
+                    nodePtr = node.children[i].value();
+                }
+            }
+        }
+    }
+
+    // number of keys strictly less than key (the inverse of getByIndex)
+    long sortedRank(long rootPtr, byte[] key) throws IOException {
+        var nodePtr = rootPtr;
+        long rank = 0;
+        while (true) {
+            var node = readSortedNode(nodePtr);
+            switch (node.kind) {
+                case LEAF -> {
+                    for (int i = 0; i < node.num; i++) {
+                        var kv = readKvPair(node.entries[i]);
+                        if (compareKey(kv.keySlot(), key) < 0) rank += 1;
+                        else break;
+                    }
+                    return rank;
+                }
+                case BRANCH -> {
+                    int i = 0;
+                    while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) { rank += node.counts[i]; i++; }
+                    nodePtr = node.children[i].value();
+                }
+            }
+        }
+    }
+
+    // write a byte key as a short_bytes (inline, <=8 bytes, no interior zero) or
+    // external bytes slot
+    private Slot writeKey(byte[] key) throws IOException {
+        boolean hasZero = false;
+        for (byte b : key) {
+            if (b == 0) { hasZero = true; break; }
+        }
+        if (key.length <= 8 && !hasZero) {
+            var value = new byte[8];
+            System.arraycopy(key, 0, value, 0, key.length);
+            var buf = ByteBuffer.wrap(value);
+            return new Slot(buf.getLong(), Tag.SHORT_BYTES);
+        }
+        var writer = this.core.writer();
+        var pos = this.core.length();
+        this.core.seek(pos);
+        writer.writeLong(key.length);
+        writer.write(key);
+        return new Slot(pos, Tag.BYTES);
+    }
+
+    // materialize a new leaf entry: write the key bytes and a KeyValuePair with an
+    // empty value (the caller fills it via valuePosition). the hash field is unused by
+    // sorted maps (navigation is by key bytes), so it is left zero.
+    private SortedEntry sortedNewEntry(byte[] key) throws IOException {
+        var keySlot = writeKey(key);
+        var writer = this.core.writer();
+        var kvPos = this.core.length();
+        var kvPair = new KeyValuePair(new Slot(), keySlot, new byte[this.header.hashSize()]);
+        this.core.seek(kvPos);
+        writer.write(kvPair.toBytes());
+        return new SortedEntry(new Slot(kvPos, Tag.KV_PAIR), keySlot, kvPos + this.header.hashSize() + Slot.length);
+    }
+
+    // insert key (or locate it for replacement) within the subtree at nodePtr,
+    // path-copying nodes and maintaining separators + counts. the caller writes the
+    // value at the returned valuePosition.
+    private SortedInsertResult sortedPut(long nodePtr, byte[] key) throws IOException {
+        var node = readSortedNode(nodePtr);
+        var writer = this.core.writer();
+        switch (node.kind) {
+            case LEAF -> {
+                // find the matching or insertion index
+                int idx = node.num;
+                boolean found = false;
+                for (int i = 0; i < node.num; i++) {
+                    var kv = readKvPair(node.entries[i]);
+                    int cmp = compareKey(kv.keySlot(), key);
+                    if (cmp == 0) { idx = i; found = true; break; }
+                    if (cmp > 0) { idx = i; break; }
+                }
+
+                if (found) {
+                    // replace: return a writable value slot, copy-on-writing the
+                    // kv_pair if it belongs to a past moment
+                    var leaf = node;
+                    var kvSlot = node.entries[idx];
+                    long valuePosition;
+                    if (btreeReusable(kvSlot.value())) {
+                        valuePosition = kvSlot.value() + this.header.hashSize() + Slot.length;
+                    } else {
+                        var kv = readKvPair(kvSlot);
+                        var newKvPos = this.core.length();
+                        this.core.seek(newKvPos);
+                        writer.write(kv.toBytes());
+                        leaf.entries[idx] = new Slot(newKvPos, Tag.KV_PAIR);
+                        valuePosition = newKvPos + this.header.hashSize() + Slot.length;
+                    }
+                    var ptr = sortedWriteNode(leaf, nodePtr);
+                    return new SortedInsertResult(ptr, node.num, valuePosition, false, null);
+                }
+
+                // insert a new entry at idx
+                var entry = sortedNewEntry(key);
+                var entries = new Slot[BTREE_SLOT_COUNT + 1];
+                for (int i = 0; i < entries.length; i++) entries[i] = new Slot();
+                System.arraycopy(node.entries, 0, entries, 0, idx);
+                entries[idx] = entry.kvSlot();
+                System.arraycopy(node.entries, idx, entries, idx + 1, node.num - idx);
+                int total = node.num + 1;
+
+                if (total <= BTREE_SLOT_COUNT) {
+                    var leaf = new SortedNode(BTreeNodeKind.LEAF, total);
+                    System.arraycopy(entries, 0, leaf.entries, 0, total);
+                    var ptr = sortedWriteNode(leaf, nodePtr);
+                    return new SortedInsertResult(ptr, total, entry.valuePosition(), true, null);
+                }
+
+                // overflow: split into two leaves; the new sibling's separator is the
+                // key of its first entry
+                int leftN = BTREE_SPLIT_COUNT;
+                int rightN = total - leftN;
+                var left = new SortedNode(BTreeNodeKind.LEAF, leftN);
+                System.arraycopy(entries, 0, left.entries, 0, leftN);
+                var right = new SortedNode(BTreeNodeKind.LEAF, rightN);
+                System.arraycopy(entries, leftN, right.entries, 0, rightN);
+                var separator = readKvPair(entries[leftN]).keySlot();
+                var leftPtr = sortedWriteNode(left, nodePtr);
+                var rightPtr = writeSortedNode(right);
+                return new SortedInsertResult(leftPtr, leftN, entry.valuePosition(), true, new SortedSplit(rightPtr, rightN, separator));
+            }
+            case BRANCH -> {
+                int i = 0;
+                while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
+                var child = sortedPut(node.children[i].value(), key);
+
+                var children = new Slot[BTREE_SLOT_COUNT + 1];
+                var separators = new Slot[BTREE_SLOT_COUNT + 1];
+                var counts = new long[BTREE_SLOT_COUNT + 1];
+                for (int k = 0; k < children.length; k++) { children[k] = new Slot(); separators[k] = new Slot(); }
+                System.arraycopy(node.children, 0, children, 0, node.num);
+                System.arraycopy(node.separators, 0, separators, 0, node.num);
+                System.arraycopy(node.counts, 0, counts, 0, node.num);
+                children[i] = new Slot(child.nodePtr(), Tag.INDEX);
+                counts[i] = child.count();
+                int total = node.num;
+                if (child.split() != null) {
+                    var split = child.split();
+                    for (int j = node.num; j > i + 1; j--) {
+                        children[j] = children[j - 1];
+                        separators[j] = separators[j - 1];
+                        counts[j] = counts[j - 1];
+                    }
+                    children[i + 1] = new Slot(split.nodePtr(), Tag.INDEX);
+                    separators[i + 1] = split.separator();
+                    counts[i + 1] = split.count();
+                    total = node.num + 1;
+                }
+
+                if (total <= BTREE_SLOT_COUNT) {
+                    var branch = new SortedNode(BTreeNodeKind.BRANCH, total);
+                    System.arraycopy(children, 0, branch.children, 0, total);
+                    System.arraycopy(separators, 0, branch.separators, 0, total);
+                    System.arraycopy(counts, 0, branch.counts, 0, total);
+                    var ptr = sortedWriteNode(branch, nodePtr);
+                    return new SortedInsertResult(ptr, branch.subtreeCount(), child.valuePosition(), child.added(), null);
+                }
+
+                // overflow: split into two branches; the new sibling's separator is the
+                // smallest key of its first child (separators[leftN] of the combined)
+                int leftN = BTREE_SPLIT_COUNT;
+                int rightN = total - leftN;
+                var left = new SortedNode(BTreeNodeKind.BRANCH, leftN);
+                System.arraycopy(children, 0, left.children, 0, leftN);
+                System.arraycopy(separators, 0, left.separators, 0, leftN);
+                System.arraycopy(counts, 0, left.counts, 0, leftN);
+                var right = new SortedNode(BTreeNodeKind.BRANCH, rightN);
+                System.arraycopy(children, leftN, right.children, 0, rightN);
+                System.arraycopy(separators, leftN, right.separators, 0, rightN);
+                System.arraycopy(counts, leftN, right.counts, 0, rightN);
+                var separator = separators[leftN];
+                var leftPtr = sortedWriteNode(left, nodePtr);
+                var rightPtr = writeSortedNode(right);
+                return new SortedInsertResult(leftPtr, left.subtreeCount(), child.valuePosition(), child.added(), new SortedSplit(rightPtr, right.subtreeCount(), separator));
+            }
+        }
+        throw new UnreachableException();
+    }
+
+    // remove key from the subtree at nodePtr, path-copying nodes and decrementing
+    // counts. an emptied leaf is left in place (see SortedRemoveResult).
+    private SortedRemoveResult sortedRemove(long nodePtr, byte[] key) throws IOException {
+        var node = readSortedNode(nodePtr);
+        switch (node.kind) {
+            case LEAF -> {
+                int idx = node.num;
+                boolean found = false;
+                for (int i = 0; i < node.num; i++) {
+                    var kv = readKvPair(node.entries[i]);
+                    int cmp = compareKey(kv.keySlot(), key);
+                    if (cmp == 0) { idx = i; found = true; break; }
+                    if (cmp > 0) break;
+                }
+                if (!found) return new SortedRemoveResult(nodePtr, false);
+
+                var leaf = new SortedNode(BTreeNodeKind.LEAF, node.num - 1);
+                System.arraycopy(node.entries, 0, leaf.entries, 0, idx);
+                System.arraycopy(node.entries, idx + 1, leaf.entries, idx, node.num - 1 - idx);
+                var ptr = sortedWriteNode(leaf, nodePtr);
+                return new SortedRemoveResult(ptr, true);
+            }
+            case BRANCH -> {
+                int i = 0;
+                while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
+                var child = sortedRemove(node.children[i].value(), key);
+                if (!child.found()) return new SortedRemoveResult(nodePtr, false);
+
+                var branch = node;
+                branch.children[i] = new Slot(child.nodePtr(), Tag.INDEX);
+                branch.counts[i] -= 1;
+                var ptr = sortedWriteNode(branch, nodePtr);
+                return new SortedRemoveResult(ptr, true);
+            }
+        }
+        throw new UnreachableException();
+    }
+
+    private long sortedGrowRoot(SortedInsertResult result) throws IOException {
+        if (result.split() != null) {
+            var split = result.split();
+            var root = new SortedNode(BTreeNodeKind.BRANCH, 2);
+            root.children[0] = new Slot(result.nodePtr(), Tag.INDEX);
+            root.children[1] = new Slot(split.nodePtr(), Tag.INDEX);
+            root.separators[1] = split.separator(); // separators[0] is an unused sentinel
+            root.counts[0] = result.count();
+            root.counts[1] = split.count();
+            return writeSortedNode(root);
+        }
+        return result.nodePtr();
+    }
+
+    // turn a located/inserted kv_pair (at kvPos) into the slot for the requested
+    // target. only the value is writeable (that is how put works); the key and the
+    // kv_pair pointer are immutable, so they are returned with no writeable position.
+    private SlotPointer sortedTargetSlot(long kvPos, SortedMapGetTarget target) throws IOException {
+        var kv = readKvPair(new Slot(kvPos, Tag.KV_PAIR));
+        if (target instanceof SortedMapGetKVPair) {
+            return new SlotPointer(null, new Slot(kvPos, Tag.KV_PAIR));
+        } else if (target instanceof SortedMapGetKey) {
+            return new SlotPointer(null, kv.keySlot());
+        } else if (target instanceof SortedMapGetValue) {
+            return new SlotPointer(kvPos + this.header.hashSize() + Slot.length, kv.valueSlot());
+        } else {
+            throw new IllegalArgumentException();
+        }
+    }
+
     // compaction helpers
 
     private static Slot remapSlot(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
@@ -2032,6 +2670,13 @@ public class Database {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapKvPair(sourceCore, targetCore, hashSize, offsetMap, slot);
+                offsetMap.put(slot.value(), newOffset);
+                return new Slot(newOffset, slot.tag(), slot.full());
+            }
+            case SORTED_MAP, SORTED_SET -> {
+                var mapped = offsetMap.get(slot.value());
+                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
+                var newOffset = remapSortedMap(sourceCore, targetCore, hashSize, offsetMap, slot);
                 offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
@@ -2198,6 +2843,103 @@ public class Database {
                 targetWriter.writeByte(kindInt);
                 targetWriter.writeByte(num);
                 for (var s : children) targetWriter.write(s.toBytes());
+                for (var c : counts) targetWriter.writeLong(c);
+
+                offsetMap.put(nodeOffset, newOffset);
+                return newOffset;
+            }
+        }
+        throw new UnreachableException();
+    }
+
+    private static long remapSortedMap(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
+        sourceCore.seek(slot.value());
+        var sourceReader = sourceCore.reader();
+        var headerBytes = new byte[BTreeHeader.length];
+        sourceReader.readFully(headerBytes);
+        var header = BTreeHeader.fromBytes(headerBytes);
+
+        var remappedRoot = remapSortedMapNode(sourceCore, targetCore, hashSize, offsetMap, header.rootPtr());
+
+        var newOffset = targetCore.length();
+        targetCore.seek(newOffset);
+        var targetWriter = targetCore.writer();
+        targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
+
+        return newOffset;
+    }
+
+    private static long remapSortedMapNode(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, long nodeOffset) throws Exception {
+        var mapped = offsetMap.get(nodeOffset);
+        if (mapped != null) return mapped;
+
+        sourceCore.seek(nodeOffset);
+        var sourceReader = sourceCore.reader();
+        var nodeHeader = new byte[BTREE_NODE_HEADER_SIZE];
+        sourceReader.readFully(nodeHeader);
+        var kindInt = nodeHeader[0] & 0xFF;
+        if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+        var kind = BTreeNodeKind.values()[kindInt];
+        var num = nodeHeader[1] & 0xFF;
+
+        switch (kind) {
+            case LEAF -> {
+                var body = new byte[Slot.length * BTREE_SLOT_COUNT];
+                sourceReader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+
+                var entries = new Slot[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    var entry = Slot.fromBytes(slotBytes);
+                    entries[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, entry);
+                }
+
+                var newOffset = targetCore.length();
+                targetCore.seek(newOffset);
+                var targetWriter = targetCore.writer();
+                targetWriter.writeByte(kindInt);
+                targetWriter.writeByte(num);
+                for (var s : entries) targetWriter.write(s.toBytes());
+
+                offsetMap.put(nodeOffset, newOffset);
+                return newOffset;
+            }
+            case BRANCH -> {
+                var body = new byte[(Slot.length * 2 + 8) * BTREE_SLOT_COUNT];
+                sourceReader.readFully(body);
+                var buffer = ByteBuffer.wrap(body);
+
+                var children = new Slot[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    var child = Slot.fromBytes(slotBytes);
+                    if (child.tag() == Tag.INDEX) {
+                        var remappedPtr = remapSortedMapNode(sourceCore, targetCore, hashSize, offsetMap, child.value());
+                        children[i] = new Slot(remappedPtr, Tag.INDEX, child.full());
+                    } else {
+                        children[i] = child;
+                    }
+                }
+                var separators = new Slot[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                    var slotBytes = new byte[Slot.length];
+                    buffer.get(slotBytes);
+                    var sep = Slot.fromBytes(slotBytes);
+                    separators[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, sep);
+                }
+                var counts = new long[BTREE_SLOT_COUNT];
+                for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
+
+                var newOffset = targetCore.length();
+                targetCore.seek(newOffset);
+                var targetWriter = targetCore.writer();
+                targetWriter.writeByte(kindInt);
+                targetWriter.writeByte(num);
+                for (var s : children) targetWriter.write(s.toBytes());
+                for (var s : separators) targetWriter.write(s.toBytes());
                 for (var c : counts) targetWriter.writeLong(c);
 
                 offsetMap.put(nodeOffset, newOffset);
