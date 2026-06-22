@@ -11,12 +11,24 @@ import java.io.File;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class HighLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
+
+    // build a SortedMap key that sorts by creation time. the big-endian
+    // timestamp makes byte order match chronological order; the post id is
+    // appended so two posts with the same timestamp still get distinct keys.
+    static byte[] orderKey(long timestamp, byte[] postId) {
+        var key = ByteBuffer.allocate(Long.BYTES + postId.length);
+        key.putLong(timestamp); // ByteBuffer is big-endian by default
+        key.put(postId);
+        return key.array();
+    }
 
     @Test
     void testHightLevelApi() throws Exception {
@@ -877,6 +889,81 @@ class HighLevelDatabaseTest {
             var bigCitiesCursor = moment.getCursor("big-cities");
             var bigCities = new ReadArrayList(bigCitiesCursor);
             assertEquals(2, bigCities.count());
+        }
+
+        // build a secondary index with a SortedMap to sort and paginate,
+        // like the "Sorting and Paginating" section of the readme
+        {
+            var history = new WriteArrayList(db.rootCursor());
+
+            record Post(String id, String title, long createdTs) {}
+
+            // post ids are fixed-length so the timestamp tie-breaker stays aligned
+            var newPosts = List.of(
+                new Post("post000000000001", "Hello, world", 1_700_000_000L),
+                new Post("post000000000002", "Second post", 1_700_000_500L),
+                new Post("post000000000003", "Third post", 1_700_001_000L));
+
+            history.appendContext(history.getSlot(-1), (cursor) -> {
+                var moment = new WriteHashMap(cursor);
+
+                // the primary store: a HashMap from post id to the post's fields
+                var idToPostCursor = moment.putCursor("id->post");
+                var idToPost = new WriteHashMap(idToPostCursor);
+
+                // the secondary index: a SortedMap ordered by creation time
+                var createdTsToPostIdCursor = moment.putCursor("created-ts->post-id");
+                var createdTsToPostId = new WriteSortedMap(createdTsToPostIdCursor);
+
+                for (var post : newPosts) {
+                    var postCursor = idToPost.putCursor(post.id());
+                    var postMap = new WriteHashMap(postCursor);
+                    postMap.put("title", new Database.Bytes(post.title()));
+                    postMap.put("created-ts", new Database.Uint(post.createdTs()));
+
+                    var orderKey = orderKey(post.createdTs(), post.id().getBytes());
+                    createdTsToPostId.put(orderKey, new Database.Bytes(post.id()));
+                }
+            });
+
+            var momentCursor = history.getCursor(-1);
+            var moment = new ReadHashMap(momentCursor);
+
+            var idToPostCursor = moment.getCursor("id->post");
+            var idToPost = new ReadHashMap(idToPostCursor);
+
+            var createdTsToPostIdCursor = moment.getCursor("created-ts->post-id");
+            var createdTsToPostId = new ReadSortedMap(createdTsToPostIdCursor);
+
+            assertEquals(newPosts.size(), createdTsToPostId.count());
+
+            // page through the index two at a time, oldest first, and check we
+            // get every post back in creation order
+            long pageSize = 2;
+            var expectedTitles = List.of("Hello, world", "Second post", "Third post");
+
+            long count = createdTsToPostId.count();
+            int seen = 0;
+            for (long after = 0; after < count; after += pageSize) {
+                long end = Math.min(after + pageSize, count);
+                var iter = createdTsToPostId.iteratorFromIndex(after);
+                for (long i = after; i < end && iter.hasNext(); i++) {
+                    var idCursor = iter.next();
+                    var idKv = idCursor.readKeyValuePair();
+
+                    // the index entry's value is the post id; use it to read the
+                    // full post out of the primary map
+                    var postId = new String(idKv.valueCursor.readBytes(MAX_READ_BYTES));
+
+                    var postCursor = idToPost.getCursor(postId);
+                    var postMap = new ReadHashMap(postCursor);
+                    var titleCursor = postMap.getCursor("title");
+                    var title = new String(titleCursor.readBytes(MAX_READ_BYTES));
+                    assertEquals(expectedTitles.get(seen), title);
+                    seen += 1;
+                }
+            }
+            assertEquals(newPosts.size(), seen);
         }
     }
 
