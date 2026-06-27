@@ -1434,6 +1434,21 @@ class HighLevelDatabaseTest {
                     var iter = map.iteratorFromIndex(COUNT - 2);
                     assertEquals("k0058", new String(iter.next().readKeyValuePair().keyCursor.readBytes(MAX_READ_BYTES)));
                 }
+                // negative indexes count from the end: -1 is the last entry, -COUNT the first
+                {
+                    var iter = map.iteratorFromIndex(-1);
+                    assertEquals("k0059", new String(iter.next().readKeyValuePair().keyCursor.readBytes(MAX_READ_BYTES)));
+                    assertTrue(!iter.hasNext()); // -1 is the last entry, so nothing follows
+                }
+                {
+                    var iter = map.iteratorFromIndex(-COUNT);
+                    assertEquals("k0000", new String(iter.next().readKeyValuePair().keyCursor.readBytes(MAX_READ_BYTES)));
+                }
+                // out of range past either end yields nothing
+                {
+                    assertTrue(!map.iteratorFromIndex(COUNT).hasNext());
+                    assertTrue(!map.iteratorFromIndex(-COUNT - 1).hasNext());
+                }
 
                 // remove the even keys, then re-verify order, count, and presence
                 {
@@ -1553,6 +1568,105 @@ class HighLevelDatabaseTest {
             var map1 = new ReadSortedMap(m1.getCursor("map"));
             assertEquals(COUNT / 2, map1.count());
             assertEquals(7, map1.getCursor("k0001").readUint());
+        }
+    }
+
+    @Test
+    void testIteratorFrom() throws Exception {
+        try (var ram = new RandomAccessMemory()) {
+            var core = new CoreMemory(ram);
+            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+            testIteratorFrom(core, hasher);
+        }
+
+        {
+            var file = File.createTempFile("database", "");
+            file.deleteOnExit();
+            try (var raf = new RandomAccessFile(file, "rw")) {
+                var core = new CoreFile(raf);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testIteratorFrom(core, hasher);
+            }
+        }
+
+        {
+            var file = File.createTempFile("database", "");
+            file.deleteOnExit();
+            try (var raf = new RandomAccessBufferedFile(file, "rw")) {
+                var core = new CoreBufferedFile(raf);
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testIteratorFrom(core, hasher);
+            }
+        }
+    }
+
+    void testIteratorFrom(Core core, Hasher hasher) throws Exception {
+        var db = new Database(core, hasher);
+        var rootCursor = db.rootCursor();
+
+        // enough items to force several tiers in both the array-list radix trie
+        // (16^2 = 256 > 200) and the linked-array-list b-tree
+        final int COUNT = 200;
+
+        rootCursor.writePath(new Database.PathPart[]{
+            new Database.ArrayListInit(),
+            new Database.ArrayListAppend(),
+            new Database.HashMapInit(),
+            new Database.Context((cursor) -> {
+                var moment = new WriteHashMap(cursor);
+                var list = new WriteArrayList(moment.putCursor("list"));
+                for (int i = 0; i < COUNT; i++) list.append(new Database.Uint(i));
+                var linked = new WriteLinkedArrayList(moment.putCursor("linked"));
+                for (int i = 0; i < COUNT; i++) linked.append(new Database.Uint(i));
+            })
+        });
+
+        var history = new ReadArrayList(db.rootCursor());
+        var moment = new ReadHashMap(history.getCursor(-1));
+        var list = new ReadArrayList(moment.getCursor("list"));
+        var linked = new ReadLinkedArrayList(moment.getCursor("linked"));
+
+        // iteratorFrom(k) yields exactly k, k+1, .., COUNT-1 in order, for both
+        // types. negative indexes count from the end: -1 starts at the last
+        // element, -COUNT at the first.
+        long[] starts = { 0, 1, 15, 16, 17, 100, COUNT - 2, COUNT - 1, -1, -2, -16, -100, -COUNT };
+        for (long start : starts) {
+            long resolved = start < 0 ? COUNT + start : start;
+            {
+                var iter = list.iteratorFrom(start);
+                long expected = resolved;
+                while (iter.hasNext()) {
+                    assertEquals(expected, iter.next().readUint());
+                    expected += 1;
+                }
+                assertEquals(COUNT, expected);
+            }
+            {
+                var iter = linked.iteratorFrom(start);
+                long expected = resolved;
+                while (iter.hasNext()) {
+                    assertEquals(expected, iter.next().readUint());
+                    expected += 1;
+                }
+                assertEquals(COUNT, expected);
+            }
+        }
+
+        // iteratorFrom(0) matches a plain iterator()
+        {
+            var a = list.iterator();
+            var b = list.iteratorFrom(0);
+            while (a.hasNext()) {
+                assertEquals(a.next().readUint(), b.next().readUint());
+            }
+            assertTrue(!b.hasNext());
+        }
+
+        // a start out of range (past the end, or more negative than -COUNT) yields nothing
+        long[] outOfRange = { COUNT, COUNT + 1, COUNT + 1000, -COUNT - 1, -COUNT - 1000 };
+        for (long start : outOfRange) {
+            assertTrue(!list.iteratorFrom(start).hasNext());
+            assertTrue(!linked.iteratorFrom(start).hasNext());
         }
     }
 }

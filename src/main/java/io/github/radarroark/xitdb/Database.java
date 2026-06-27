@@ -1624,7 +1624,7 @@ public class Database {
 
     // b-tree
 
-    private BTreeNode readBTreeNode(long ptr) throws IOException {
+    BTreeNode readBTreeNode(long ptr) throws IOException {
         this.core.seek(ptr);
         var reader = this.core.reader();
         var headerBytes = new byte[BTREE_NODE_HEADER_SIZE];

@@ -364,16 +364,68 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             this.stack = stack;
         }
 
+        // resolve a possibly-negative start index against `size` to a 0-based
+        // rank. negatives count from the end (-1 is the last entry); anything
+        // out of range returns -1 (yield nothing).
+        private static long resolveStartIndex(long index, long size) {
+            var resolved = index < 0 ? index + size : index;
+            if (resolved < 0 || resolved >= size) return -1;
+            return resolved;
+        }
+
         // start a sorted-map iterator at the entry with rank startIndex (the count
         // descent), iterating in key order from there
         public static Iterator initSortedFromIndex(ReadCursor cursor, long startIndex) throws IOException {
-            var total = cursor.count();
             // an unwritten map is NONE (like iterator()): yield nothing
-            if (cursor.slotPtr.slot().tag() == Tag.NONE || startIndex >= total) {
+            if (cursor.slotPtr.slot().tag() == Tag.NONE) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            var total = cursor.count();
+            var idx = resolveStartIndex(startIndex, total);
+            if (idx < 0) {
                 return new Iterator(cursor, 0, 0, new Stack<Level>());
             }
             var rootPtr = sortedRootPtr(cursor);
-            return new Iterator(cursor, total, startIndex, sortedStackFromIndex(cursor, rootPtr, startIndex));
+            return new Iterator(cursor, total, idx, sortedStackFromIndex(cursor, rootPtr, idx));
+        }
+
+        // start an array-list iterator at startIndex, descending the radix trie
+        // straight to that index. negatives count from the end; out of range
+        // (or an unwritten list) yields nothing.
+        public static Iterator initArrayListFromIndex(ReadCursor cursor, long startIndex) throws IOException {
+            if (cursor.slotPtr.slot().tag() != Tag.ARRAY_LIST) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            cursor.db.core.seek(cursor.slotPtr.slot().value());
+            var reader = cursor.db.core.reader();
+            var headerBytes = new byte[Database.ArrayListHeader.length];
+            reader.readFully(headerBytes);
+            var header = Database.ArrayListHeader.fromBytes(headerBytes);
+            var idx = resolveStartIndex(startIndex, header.size());
+            if (idx < 0) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            var lastKey = header.size() - 1;
+            var shift = (byte) (lastKey < Database.SLOT_COUNT ? 0 : Math.log(lastKey) / Math.log(Database.SLOT_COUNT));
+            return new Iterator(cursor, header.size(), idx, arrayListStackFromIndex(cursor, header.ptr(), idx, shift));
+        }
+
+        // start a linked-array-list iterator at startIndex, descending the
+        // count-augmented b-tree straight to that index. negatives count from the end.
+        public static Iterator initLinkedArrayListFromIndex(ReadCursor cursor, long startIndex) throws IOException {
+            if (cursor.slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            cursor.db.core.seek(cursor.slotPtr.slot().value());
+            var reader = cursor.db.core.reader();
+            var headerBytes = new byte[Database.BTreeHeader.length];
+            reader.readFully(headerBytes);
+            var header = Database.BTreeHeader.fromBytes(headerBytes);
+            var idx = resolveStartIndex(startIndex, header.size());
+            if (idx < 0) {
+                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            }
+            return new Iterator(cursor, header.size(), idx, btreeStackFromIndex(cursor, header.rootPtr(), idx));
         }
 
         // start a sorted-map iterator at the first entry with key >= startKey
@@ -410,6 +462,49 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 switch (node.kind) {
                     case LEAF -> {
                         stack.add(new Level(position, node.entries, (byte) rem));
+                        return stack;
+                    }
+                    case BRANCH -> {
+                        int i = 0;
+                        while (i + 1 < node.num && rem >= node.counts[i]) { rem -= node.counts[i]; i++; }
+                        stack.add(new Level(position, node.children, (byte) i));
+                        nodePtr = node.children[i].value();
+                    }
+                }
+            }
+        }
+
+        // descend the array-list radix trie to startIndex, pushing one Level per
+        // tier with its index set to that tier's child slot. nextInternal then
+        // walks forward from there.
+        private static Stack<Level> arrayListStackFromIndex(ReadCursor cursor, long rootPtr, long startIndex, byte shift) throws IOException {
+            var stack = new Stack<Level>();
+            var pos = rootPtr;
+            var sh = shift;
+            while (true) {
+                var block = readSlotBlock(cursor, pos);
+                int i = (int) ((startIndex >> (sh * Database.BIT_COUNT)) & Database.MASK);
+                stack.add(new Level(pos, block, (byte) i));
+                if (sh == 0) return stack;
+                // every tier above the leaf is a populated INDEX slot for any
+                // startIndex < size, so this child always exists
+                pos = block[i].value();
+                sh -= 1;
+            }
+        }
+
+        // descend the linked-array-list count b-tree to startIndex; the positional
+        // analog of sortedStackFromIndex (no separator keys).
+        private static Stack<Level> btreeStackFromIndex(ReadCursor cursor, long rootPtr, long startIndex) throws IOException {
+            var stack = new Stack<Level>();
+            var nodePtr = rootPtr;
+            var rem = startIndex;
+            while (true) {
+                var node = cursor.db.readBTreeNode(nodePtr);
+                var position = nodePtr + Database.BTREE_NODE_HEADER_SIZE;
+                switch (node.kind) {
+                    case LEAF -> {
+                        stack.add(new Level(position, node.values, (byte) rem));
                         return stack;
                     }
                     case BRANCH -> {
