@@ -291,108 +291,135 @@ assertEquals(2, bigCities.count());
 
 ## Sorting and Paginating
 
-The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order, which is meaningless to a human. You may need to display data in a sensible order (like newest posts first or users by signup date) and show it one page at a time. Relational databases like SQLite have this built-in: you declare a `CREATE INDEX`, write `ORDER BY created_ts LIMIT 20 OFFSET 40`, and the query planner maintains the index and seeks into it for you.
+The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order, which is meaningless to a human. Real apps need to show data in a sensible order (such as users listed alphabetically) one page at a time. Relational databases like SQLite have this built-in: you declare a `CREATE INDEX`, write `ORDER BY username LIMIT 20 OFFSET 40`, and the query planner maintains the index for you.
 
-In xitdb there are no built-in indexes, so you build and maintain them yourself. That's a little more code, but the index is just another data structure: a `SortedMap` whose keys are crafted to sort the way you want. You keep it in sync by writing to it in the same transaction that writes the primary data.
+In xitdb there are no built-in indexes, so you build and maintain them yourself. That's a little more code, but the index is just another data structure: a `SortedMap` whose keys sort the way you want. You keep it in sync by writing to it in the same transaction that writes the primary data.
 
-Let's model the storage a basic blog would need: a collection of posts we look up by id, plus a secondary index that lets us list them oldest-first with pagination. The primary store is a `HashMap` from post id to the post's fields (like a row keyed by its primary key). The secondary index is a `SortedMap` keyed by creation time, whose value is the post id to look up.
+Why a `SortedMap` and not an `ArrayList`? An `ArrayList` keeps things in insertion order, which is only useful when the order you want *is* the order you wrote them in. The moment you want a different order (alphabetical, by score, by anything that isn't "when it arrived") you need a structure that stays sorted by a key. A `SortedMap` does, and it can seek straight to the first key greater than or equal to a given value, which is what makes type-ahead search possible.
 
-The trick is the key. A `SortedMap` orders its keys lexicographically by their raw bytes, so we encode the timestamp as a big-endian integer (so byte order matches chronological order) and append the post id to break ties between posts created in the same second and keep every key unique:
+Let's model a user directory: a collection of users we look up by id, plus a secondary index that lists them alphabetically by username. The primary store is a `HashMap` from user id to the user's fields (like a row keyed by its primary key). The secondary index is a `SortedMap` keyed by username, whose value is the user id to look up.
 
-```java
-// build a SortedMap key that sorts by creation time. the big-endian
-// timestamp makes byte order match chronological order; the post id is
-// appended so two posts with the same timestamp still get distinct keys.
-static byte[] orderKey(long timestamp, byte[] postId) {
-    var key = ByteBuffer.allocate(Long.BYTES + postId.length);
-    key.putLong(timestamp); // ByteBuffer is big-endian by default
-    key.put(postId);
-    return key.array();
-}
-```
+A `SortedMap` orders its keys lexicographically by their raw bytes. For ASCII usernames that's just alphabetical order, and since usernames are unique, every key is already distinct, so the key is simply the username itself. For a sort key that *isn't* unique, like a score, you'd append the id to keep keys distinct. See the note at the end.
 
-Now we write some posts. On each insert we write the post into the primary map and add an entry to the secondary index (keeping both in sync is your job, not the database's):
+Now we write some users. Note they're inserted in arbitrary order; the index sorts them, so insertion order doesn't matter. On each insert we write the user into the primary map and add an entry to the secondary index (keeping both in sync is your job, not the database's):
 
 ```java
-record Post(String id, String title, long createdTs) {}
+record User(String id, String username, String name) {}
 
-// post ids are fixed-length so the timestamp tie-breaker stays aligned
-var newPosts = List.of(
-    new Post("post000000000001", "Hello, world", 1_700_000_000L),
-    new Post("post000000000002", "Second post", 1_700_000_500L),
-    new Post("post000000000003", "Third post", 1_700_001_000L)
+// inserted in arbitrary order; the index will sort them alphabetically
+var newUsers = List.of(
+    new User("user000000000001", "dave", "Dave Smith"),
+    new User("user000000000002", "alice", "Alice Jones"),
+    new User("user000000000003", "carol", "Carol White"),
+    new User("user000000000004", "dan", "Dan Brown"),
+    new User("user000000000005", "bob", "Bob Lee"),
+    new User("user000000000006", "eve", "Eve Adams")
 );
 
 history.appendContext(history.getSlot(-1), (cursor) -> {
     var moment = new WriteHashMap(cursor);
 
-    // the primary store: a HashMap from post id to the post's fields
-    var idToPostCursor = moment.putCursor("id->post");
-    var idToPost = new WriteHashMap(idToPostCursor);
+    // the primary store: a HashMap from user id to the user's fields
+    var idToUserCursor = moment.putCursor("id->user");
+    var idToUser = new WriteHashMap(idToUserCursor);
 
-    // the secondary index: a SortedMap ordered by creation time. there's
-    // no CREATE INDEX here, so we maintain it ourselves on every write.
-    var createdTsToPostIdCursor = moment.putCursor("created-ts->post-id");
-    var createdTsToPostId = new WriteSortedMap(createdTsToPostIdCursor);
+    // the secondary index: a SortedMap ordered alphabetically by username.
+    // there's no CREATE INDEX here, so we maintain it ourselves on every write.
+    var usernameToIdCursor = moment.putCursor("username->id");
+    var usernameToId = new WriteSortedMap(usernameToIdCursor);
 
-    for (var post : newPosts) {
-        // write the post into the primary map under its id
-        var postCursor = idToPost.putCursor(post.id());
-        var postMap = new WriteHashMap(postCursor);
-        postMap.put("title", new Database.Bytes(post.title()));
-        postMap.put("created-ts", new Database.Uint(post.createdTs()));
+    for (var user : newUsers) {
+        // write the user into the primary map under its id
+        var userCursor = idToUser.putCursor(user.id());
+        var userMap = new WriteHashMap(userCursor);
+        userMap.put("username", new Database.Bytes(user.username()));
+        userMap.put("name", new Database.Bytes(user.name()));
 
-        // add an entry to the secondary index. the key sorts by time,
-        // and the value is the post id we'll use to look the post back up.
-        var orderKey = orderKey(post.createdTs(), post.id().getBytes());
-        createdTsToPostId.put(orderKey, new Database.Bytes(post.id()));
+        // add an entry to the secondary index: the key is the username (the
+        // sort key), and the value is the user id we'll use to look it back up.
+        usernameToId.put(user.username(), new Database.Bytes(user.id()));
     }
 });
 ```
 
-To display a page, we walk the `SortedMap` instead of the `HashMap`. A web app would take a `pageSize` and an `after` offset from the request (something like `/posts?after=20`), so this is the xitdb equivalent of `ORDER BY created_ts LIMIT pageSize OFFSET after`:
+To display a page, we walk the `SortedMap` instead of the `HashMap`. A web app would take a `pageSize` and an `after` offset from the request (something like `/users?after=20`), so this is the xitdb equivalent of `ORDER BY username LIMIT pageSize OFFSET after`:
 
 ```java
 var momentCursor = history.getCursor(-1);
 var moment = new ReadHashMap(momentCursor);
 
-var idToPostCursor = moment.getCursor("id->post");
-var idToPost = new ReadHashMap(idToPostCursor);
+var idToUserCursor = moment.getCursor("id->user");
+var idToUser = new ReadHashMap(idToUserCursor);
 
-var createdTsToPostIdCursor = moment.getCursor("created-ts->post-id");
-var createdTsToPostId = new ReadSortedMap(createdTsToPostIdCursor);
+var usernameToIdCursor = moment.getCursor("username->id");
+var usernameToId = new ReadSortedMap(usernameToIdCursor);
 
 // a web request would supply these; here we just grab the first page
 long pageSize = 2;
 long after = 0;
 
-long count = createdTsToPostId.count();
+long count = usernameToId.count();
 long end = Math.min(after + pageSize, count);
 
 // seek straight to the start of the page, then walk forward one entry at a
 // time. because SortedMap is a count-augmented B+tree, iteratorFromIndex
 // finds rank `after` in O(log n) without scanning the entries it skips, so
 // jumping to page 500 is just as cheap as page 1.
-var iter = createdTsToPostId.iteratorFromIndex(after);
+var iter = usernameToId.iteratorFromIndex(after);
 for (long i = after; i < end && iter.hasNext(); i++) {
     var idCursor = iter.next();
     var idKv = idCursor.readKeyValuePair();
 
-    // the index entry's value is the post id; use it to read the
-    // full post out of the primary map
-    var postId = new String(idKv.valueCursor.readBytes(MAX_READ_BYTES));
+    // the index entry's value is the user id; use it to read the
+    // full user out of the primary map
+    var userId = new String(idKv.valueCursor.readBytes(MAX_READ_BYTES));
 
-    var postCursor = idToPost.getCursor(postId);
-    var postMap = new ReadHashMap(postCursor);
-    var titleCursor = postMap.getCursor("title");
-    var title = new String(titleCursor.readBytes(MAX_READ_BYTES));
+    var userCursor = idToUser.getCursor(userId);
+    var userMap = new ReadHashMap(userCursor);
+    var nameCursor = userMap.getCursor("name");
+    var name = new String(nameCursor.readBytes(MAX_READ_BYTES));
 
     // a real app would render this into the page's HTML
-    System.out.println(title);
+    System.out.println(name);
 }
 ```
 
-This works for any ordering you need: sort by a username with a string key, by score with a big-endian integer key, or build several `SortedMap` indexes over the same primary `HashMap` to offer the data in different orders. With xitdb you "bring your own index". It takes a bit more effort than the declarative convenience of SQL databases, but it gives you more explicit control, and avoids the common problem in SQL where queries silently become inefficient due to not using indexes. In xitdb, inefficiency is hard to miss because you are always writing your queries as imperative code and the indexes are always explicit.
+Pagination by index is only half of what the ordering buys us. Because the index is sorted by username, we can also seek straight to a *key* (the first username greater than or equal to a prefix) and walk forward only as far as the prefix matches. That's a type-ahead search (think @-mention autocomplete), and it's the thing an `ArrayList` can't do: with no sorted index, there's nothing to seek into. We use `iteratorFrom` (which takes a key) instead of `iteratorFromIndex` (which takes a rank):
+
+```java
+// the user typed "da" into an @-mention box; find everyone whose username
+// starts with it. iteratorFrom seeks to the first key >= "da" in O(log n),
+// then we walk forward until a username no longer starts with the prefix.
+var prefix = "da";
+var acIter = usernameToId.iteratorFrom(prefix);
+while (acIter.hasNext()) {
+    var idCursor = acIter.next();
+    var idKv = idCursor.readKeyValuePair();
+
+    // the key is the username; stop once we've walked past the prefix
+    var username = new String(idKv.keyCursor.readBytes(MAX_READ_BYTES));
+    if (!username.startsWith(prefix)) break;
+
+    // a real app would offer this as a suggestion (here: "dan", then "dave")
+    System.out.println(username);
+}
+```
+
+This works for any ordering you need: sort by a username with a string key like we did here, by score with a big-endian integer key (encode numbers big-endian so their byte order matches numeric order), or build several `SortedMap` indexes over the same primary `HashMap` to offer the data in different orders. When a sort key isn't unique (many users could share a score), append the id to keep every key distinct:
+
+```java
+// build a SortedMap key that sorts by score. the big-endian score makes byte
+// order match numeric order; the user id is appended so two users with the
+// same score still get distinct keys.
+static byte[] orderKey(long score, byte[] userId) {
+    var key = ByteBuffer.allocate(Long.BYTES + userId.length);
+    key.putLong(score); // ByteBuffer is big-endian by default
+    key.put(userId);
+    return key.array();
+}
+```
+
+With xitdb you "bring your own index". It takes a bit more effort than the declarative convenience of SQL databases, but it gives you more explicit control, and avoids the common problem in SQL where queries silently become inefficient due to not using indexes. In xitdb, inefficiency is hard to miss because you are always writing your queries as imperative code and the indexes are always explicit.
 
 ## Large Byte Arrays
 

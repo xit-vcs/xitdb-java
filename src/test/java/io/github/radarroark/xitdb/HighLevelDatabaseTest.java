@@ -11,7 +11,6 @@ import java.io.File;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.List;
@@ -19,16 +18,6 @@ import org.junit.jupiter.api.Test;
 
 class HighLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
-
-    // build a SortedMap key that sorts by creation time. the big-endian
-    // timestamp makes byte order match chronological order; the post id is
-    // appended so two posts with the same timestamp still get distinct keys.
-    static byte[] orderKey(long timestamp, byte[] postId) {
-        var key = ByteBuffer.allocate(Long.BYTES + postId.length);
-        key.putLong(timestamp); // ByteBuffer is big-endian by default
-        key.put(postId);
-        return key.array();
-    }
 
     @Test
     void testHightLevelApi() throws Exception {
@@ -896,74 +885,98 @@ class HighLevelDatabaseTest {
         {
             var history = new WriteArrayList(db.rootCursor());
 
-            record Post(String id, String title, long createdTs) {}
+            record User(String id, String username, String name) {}
 
-            // post ids are fixed-length so the timestamp tie-breaker stays aligned
-            var newPosts = List.of(
-                new Post("post000000000001", "Hello, world", 1_700_000_000L),
-                new Post("post000000000002", "Second post", 1_700_000_500L),
-                new Post("post000000000003", "Third post", 1_700_001_000L));
+            // inserted in arbitrary order; the index will sort them alphabetically
+            var newUsers = List.of(
+                new User("user000000000001", "dave", "Dave Smith"),
+                new User("user000000000002", "alice", "Alice Jones"),
+                new User("user000000000003", "carol", "Carol White"),
+                new User("user000000000004", "dan", "Dan Brown"),
+                new User("user000000000005", "bob", "Bob Lee"),
+                new User("user000000000006", "eve", "Eve Adams"));
 
             history.appendContext(history.getSlot(-1), (cursor) -> {
                 var moment = new WriteHashMap(cursor);
 
-                // the primary store: a HashMap from post id to the post's fields
-                var idToPostCursor = moment.putCursor("id->post");
-                var idToPost = new WriteHashMap(idToPostCursor);
+                // the primary store: a HashMap from user id to the user's fields
+                var idToUserCursor = moment.putCursor("id->user");
+                var idToUser = new WriteHashMap(idToUserCursor);
 
-                // the secondary index: a SortedMap ordered by creation time
-                var createdTsToPostIdCursor = moment.putCursor("created-ts->post-id");
-                var createdTsToPostId = new WriteSortedMap(createdTsToPostIdCursor);
+                // the secondary index: a SortedMap ordered alphabetically by username
+                var usernameToIdCursor = moment.putCursor("username->id");
+                var usernameToId = new WriteSortedMap(usernameToIdCursor);
 
-                for (var post : newPosts) {
-                    var postCursor = idToPost.putCursor(post.id());
-                    var postMap = new WriteHashMap(postCursor);
-                    postMap.put("title", new Database.Bytes(post.title()));
-                    postMap.put("created-ts", new Database.Uint(post.createdTs()));
+                for (var user : newUsers) {
+                    var userCursor = idToUser.putCursor(user.id());
+                    var userMap = new WriteHashMap(userCursor);
+                    userMap.put("username", new Database.Bytes(user.username()));
+                    userMap.put("name", new Database.Bytes(user.name()));
 
-                    var orderKey = orderKey(post.createdTs(), post.id().getBytes());
-                    createdTsToPostId.put(orderKey, new Database.Bytes(post.id()));
+                    // the key is the username (the sort key), and the value is
+                    // the user id we'll use to look it back up
+                    usernameToId.put(user.username(), new Database.Bytes(user.id()));
                 }
             });
 
             var momentCursor = history.getCursor(-1);
             var moment = new ReadHashMap(momentCursor);
 
-            var idToPostCursor = moment.getCursor("id->post");
-            var idToPost = new ReadHashMap(idToPostCursor);
+            var idToUserCursor = moment.getCursor("id->user");
+            var idToUser = new ReadHashMap(idToUserCursor);
 
-            var createdTsToPostIdCursor = moment.getCursor("created-ts->post-id");
-            var createdTsToPostId = new ReadSortedMap(createdTsToPostIdCursor);
+            var usernameToIdCursor = moment.getCursor("username->id");
+            var usernameToId = new ReadSortedMap(usernameToIdCursor);
 
-            assertEquals(newPosts.size(), createdTsToPostId.count());
+            assertEquals(newUsers.size(), usernameToId.count());
 
-            // page through the index two at a time, oldest first, and check we
-            // get every post back in creation order
+            // page through the index two at a time, alphabetically by username,
+            // and check we get every user back in alphabetical order
             long pageSize = 2;
-            var expectedTitles = List.of("Hello, world", "Second post", "Third post");
+            var expectedNames = List.of(
+                "Alice Jones", "Bob Lee", "Carol White", "Dan Brown", "Dave Smith", "Eve Adams");
 
-            long count = createdTsToPostId.count();
+            long count = usernameToId.count();
             int seen = 0;
             for (long after = 0; after < count; after += pageSize) {
                 long end = Math.min(after + pageSize, count);
-                var iter = createdTsToPostId.iteratorFromIndex(after);
+                var iter = usernameToId.iteratorFromIndex(after);
                 for (long i = after; i < end && iter.hasNext(); i++) {
                     var idCursor = iter.next();
                     var idKv = idCursor.readKeyValuePair();
 
-                    // the index entry's value is the post id; use it to read the
-                    // full post out of the primary map
-                    var postId = new String(idKv.valueCursor.readBytes(MAX_READ_BYTES));
+                    // the index entry's value is the user id; use it to read the
+                    // full user out of the primary map
+                    var userId = new String(idKv.valueCursor.readBytes(MAX_READ_BYTES));
 
-                    var postCursor = idToPost.getCursor(postId);
-                    var postMap = new ReadHashMap(postCursor);
-                    var titleCursor = postMap.getCursor("title");
-                    var title = new String(titleCursor.readBytes(MAX_READ_BYTES));
-                    assertEquals(expectedTitles.get(seen), title);
+                    var userCursor = idToUser.getCursor(userId);
+                    var userMap = new ReadHashMap(userCursor);
+                    var nameCursor = userMap.getCursor("name");
+                    var name = new String(nameCursor.readBytes(MAX_READ_BYTES));
+                    assertEquals(expectedNames.get(seen), name);
                     seen += 1;
                 }
             }
-            assertEquals(newPosts.size(), seen);
+            assertEquals(newUsers.size(), seen);
+
+            // type-ahead autocomplete: seek to the first username >= "da", then
+            // walk forward only as far as the prefix matches (yields "dan", "dave")
+            var prefix = "da";
+            var expectedUsernames = List.of("dan", "dave");
+            int acSeen = 0;
+            var acIter = usernameToId.iteratorFrom(prefix);
+            while (acIter.hasNext()) {
+                var idCursor = acIter.next();
+                var idKv = idCursor.readKeyValuePair();
+
+                // the key is the username; stop once we've walked past the prefix
+                var username = new String(idKv.keyCursor.readBytes(MAX_READ_BYTES));
+                if (!username.startsWith(prefix)) break;
+
+                assertEquals(expectedUsernames.get(acSeen), username);
+                acSeen += 1;
+            }
+            assertEquals(expectedUsernames.size(), acSeen);
         }
     }
 
