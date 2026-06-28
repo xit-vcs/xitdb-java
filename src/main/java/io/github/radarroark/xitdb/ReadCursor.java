@@ -342,7 +342,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         ReadCursor cursor;
         long size;
         long index;
-        private Stack<Level> stack;
+        Stack<Level> stack;
         private ReadCursor nextCursorMaybe = null; // only used when iterating over hash maps
 
         public static class Level {
@@ -357,7 +357,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             }
         }
 
-        private Iterator(ReadCursor cursor, long size, long index, Stack<Level> stack) {
+        Iterator(ReadCursor cursor, long size, long index, Stack<Level> stack) {
             this.cursor = cursor;
             this.size = size;
             this.index = index;

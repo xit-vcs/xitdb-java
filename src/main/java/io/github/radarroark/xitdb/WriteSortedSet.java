@@ -1,5 +1,7 @@
 package io.github.radarroark.xitdb;
 
+import java.io.IOException;
+
 public class WriteSortedSet extends ReadSortedSet {
     protected WriteSortedSet() {
     }
@@ -13,6 +15,21 @@ public class WriteSortedSet extends ReadSortedSet {
     @Override
     public WriteCursor.Iterator iterator() {
         return ((WriteCursor)this.cursor).iterator();
+    }
+
+    @Override
+    public WriteCursor.Iterator iteratorFrom(String startKey) throws Exception {
+        return iteratorFrom(startKey.getBytes("UTF-8"));
+    }
+
+    @Override
+    public WriteCursor.Iterator iteratorFrom(byte[] startKey) throws IOException {
+        return WriteCursor.Iterator.from(ReadCursor.Iterator.initSortedFromKey(this.cursor, startKey));
+    }
+
+    @Override
+    public WriteCursor.Iterator iteratorFromIndex(long startIndex) throws IOException {
+        return WriteCursor.Iterator.from(ReadCursor.Iterator.initSortedFromIndex(this.cursor, startIndex));
     }
 
     public void put(String key) throws Exception {

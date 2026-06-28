@@ -1,5 +1,7 @@
 package io.github.radarroark.xitdb;
 
+import java.io.IOException;
+
 public class WriteArrayList extends ReadArrayList {
     public WriteArrayList(WriteCursor cursor) throws Exception {
         super(cursor.writePath(new Database.PathPart[]{
@@ -10,6 +12,11 @@ public class WriteArrayList extends ReadArrayList {
     @Override
     public WriteCursor.Iterator iterator() {
         return ((WriteCursor)this.cursor).iterator();
+    }
+
+    @Override
+    public WriteCursor.Iterator iteratorFrom(long index) throws IOException {
+        return WriteCursor.Iterator.from(ReadCursor.Iterator.initArrayListFromIndex(this.cursor, index));
     }
 
     public void put(long index, Database.WriteableData data) throws Exception {

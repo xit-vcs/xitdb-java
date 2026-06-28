@@ -138,6 +138,16 @@ public class WriteCursor extends ReadCursor {
             super(cursor);
         }
 
+        Iterator(ReadCursor cursor, long size, long index, java.util.Stack<ReadCursor.Iterator.Level> stack) {
+            super(cursor, size, index, stack);
+        }
+
+        // wrap an already-seeked read iterator so it yields write cursors. backs
+        // the write-side iteratorFrom/iteratorFromIndex methods.
+        static Iterator from(ReadCursor.Iterator inner) {
+            return new Iterator(inner.cursor, inner.size, inner.index, inner.stack);
+        }
+
         @Override
         public boolean hasNext() {
             return super.hasNext();

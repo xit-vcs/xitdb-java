@@ -1618,6 +1618,26 @@ class HighLevelDatabaseTest {
                 for (int i = 0; i < COUNT; i++) list.append(new Database.Uint(i));
                 var linked = new WriteLinkedArrayList(moment.putCursor("linked"));
                 for (int i = 0; i < COUNT; i++) linked.append(new Database.Uint(i));
+
+                // the write-side structs expose iteratorFrom too, yielding write cursors
+                {
+                    WriteCursor.Iterator it = list.iteratorFrom(COUNT - 3);
+                    long expected = COUNT - 3;
+                    while (it.hasNext()) {
+                        assertEquals(expected, it.next().readUint());
+                        expected += 1;
+                    }
+                    assertEquals(COUNT, expected);
+                }
+                {
+                    WriteCursor.Iterator it = linked.iteratorFrom(-2);
+                    long expected = COUNT - 2;
+                    while (it.hasNext()) {
+                        assertEquals(expected, it.next().readUint());
+                        expected += 1;
+                    }
+                    assertEquals(COUNT, expected);
+                }
             })
         });
 
