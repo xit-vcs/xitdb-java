@@ -91,7 +91,10 @@ public class Database {
         var hasher = new Hasher(this.md, this.header.hashId());
         var target = new Database(targetCore, hasher);
 
-        if (this.header.tag() == Tag.NONE) return target;
+        if (this.header.tag() == Tag.NONE) {
+            target.core.sync();
+            return target;
+        }
         if (this.header.tag() != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
         // read source's top-level ArrayListHeader
@@ -101,7 +104,10 @@ public class Database {
         sourceReader.readFully(headerBytes);
         var sourceHeader = ArrayListHeader.fromBytes(headerBytes);
 
-        if (sourceHeader.size() == 0) return target;
+        if (sourceHeader.size() == 0) {
+            target.core.sync();
+            return target;
+        }
 
         // read the last moment's slot
         var lastKey = sourceHeader.size() - 1;
@@ -137,6 +143,10 @@ public class Database {
         target.core.seek(DATABASE_START + ArrayListHeader.length);
         targetWriter.writeLong(fileSize);
         target.core.flush();
+
+        // fsync so the compacted database is durable, since callers
+        // typically rename it over an existing database file
+        target.core.sync();
 
         return target;
     }
