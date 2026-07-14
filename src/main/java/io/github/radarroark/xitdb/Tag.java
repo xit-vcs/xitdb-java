@@ -19,6 +19,12 @@ public enum Tag {
     SORTED_SET;
 
     public static Tag valueOf(int n) {
-        return Tag.values()[n];
+        // validate the tag so corrupted data yields an error
+        // instead of an ArrayIndexOutOfBoundsException
+        var values = Tag.values();
+        if (n < 0 || n >= values.length) {
+            throw new Database.UnexpectedTagException();
+        }
+        return values[n];
     }
 }

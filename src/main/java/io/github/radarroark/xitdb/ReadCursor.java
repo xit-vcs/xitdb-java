@@ -376,9 +376,11 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         // start a sorted-map iterator at the entry with rank startIndex (the count
         // descent), iterating in key order from there
         public static Iterator initSortedFromIndex(ReadCursor cursor, long startIndex) throws IOException {
-            // an unwritten map is NONE (like iterator()): yield nothing
-            if (cursor.slotPtr.slot().tag() == Tag.NONE) {
-                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            switch (cursor.slotPtr.slot().tag()) {
+                // an unwritten map is NONE (like iterator()): yield nothing
+                case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
+                case SORTED_MAP, SORTED_SET -> {}
+                default -> throw new Database.UnexpectedTagException();
             }
             var total = cursor.count();
             var idx = resolveStartIndex(startIndex, total);
@@ -393,8 +395,11 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         // straight to that index. negatives count from the end; out of range
         // (or an unwritten list) yields nothing.
         public static Iterator initArrayListFromIndex(ReadCursor cursor, long startIndex) throws IOException {
-            if (cursor.slotPtr.slot().tag() != Tag.ARRAY_LIST) {
-                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            switch (cursor.slotPtr.slot().tag()) {
+                // an unwritten list is NONE (like iterator()): yield nothing
+                case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
+                case ARRAY_LIST -> {}
+                default -> throw new Database.UnexpectedTagException();
             }
             cursor.db.core.seek(cursor.slotPtr.slot().value());
             var reader = cursor.db.core.reader();
@@ -413,8 +418,11 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         // start a linked-array-list iterator at startIndex, descending the
         // count-augmented b-tree straight to that index. negatives count from the end.
         public static Iterator initLinkedArrayListFromIndex(ReadCursor cursor, long startIndex) throws IOException {
-            if (cursor.slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) {
-                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            switch (cursor.slotPtr.slot().tag()) {
+                // an unwritten list is NONE (like iterator()): yield nothing
+                case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
+                case LINKED_ARRAY_LIST -> {}
+                default -> throw new Database.UnexpectedTagException();
             }
             cursor.db.core.seek(cursor.slotPtr.slot().value());
             var reader = cursor.db.core.reader();
@@ -430,8 +438,11 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
 
         // start a sorted-map iterator at the first entry with key >= startKey
         public static Iterator initSortedFromKey(ReadCursor cursor, byte[] startKey) throws IOException {
-            if (cursor.slotPtr.slot().tag() == Tag.NONE) {
-                return new Iterator(cursor, 0, 0, new Stack<Level>());
+            switch (cursor.slotPtr.slot().tag()) {
+                // an unwritten map is NONE (like iterator()): yield nothing
+                case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
+                case SORTED_MAP, SORTED_SET -> {}
+                default -> throw new Database.UnexpectedTagException();
             }
             var total = cursor.count();
             var rootPtr = sortedRootPtr(cursor);
