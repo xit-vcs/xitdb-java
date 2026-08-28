@@ -3,6 +3,7 @@ package io.github.radarroark.xitdb;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
 import java.io.DataOutput;
+import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -139,6 +140,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
     @Override
     public void readFully(byte[] b, int off, int len) throws IOException {
         int pos = this.position.get();
+        if (pos > this.count - len) throw new EOFException();
         System.arraycopy(this.buf, pos, b, off, len);
         this.position.set(pos + len);
     }

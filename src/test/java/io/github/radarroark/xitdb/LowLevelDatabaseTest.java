@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.io.EOFException;
 import java.io.File;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
@@ -68,6 +69,9 @@ class LowLevelDatabaseTest {
 
             var reader = textCursor.reader();
             assertEquals("goodbye, cruel world!", new String(reader.readAllBytes()));
+
+            core.seek(core.length() + 1);
+            assertThrows(EOFException.class, () -> core.reader().readFully(new byte[1]));
         }
     }
 
