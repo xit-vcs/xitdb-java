@@ -4,7 +4,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
-public interface Core {
+public interface Core extends AutoCloseable {
     public DataInput reader();
 
     public DataOutput writer();
@@ -20,4 +20,7 @@ public interface Core {
     public void flush() throws IOException;
 
     public void sync() throws IOException;
+
+    @Override
+    public void close() throws IOException;
 }

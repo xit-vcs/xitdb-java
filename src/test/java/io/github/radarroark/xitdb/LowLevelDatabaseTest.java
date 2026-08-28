@@ -19,8 +19,7 @@ class LowLevelDatabaseTest {
 
     @Test
     void testLowLevelApi() throws Exception {
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             testLowLevelApi(core, hasher);
         }
@@ -29,8 +28,7 @@ class LowLevelDatabaseTest {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
 
-            try (var raf = new RandomAccessFile(file, "rw")) {
-                var core = new CoreFile(raf);
+            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testLowLevelApi(core, hasher);
             }
@@ -40,8 +38,7 @@ class LowLevelDatabaseTest {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
 
-            try (var raf = new RandomAccessBufferedFile(file, "rw", 1024)) {
-                var core = new CoreBufferedFile(raf);
+            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw", 1024))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testLowLevelApi(core, hasher);
             }
@@ -50,8 +47,7 @@ class LowLevelDatabaseTest {
 
     @Test
     void testLowLevelMemoryOperations() throws Exception {
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             var db = new Database(core, hasher);
 

@@ -37,9 +37,8 @@ This database was originally made for the [xit version control system](https://g
 In this example, we create a new database, write some data in a transaction, and read the data afterwards.
 
 ```java
-try (var raf = new RandomAccessBufferedFile(new File("main.db"), "rw")) {
+try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(new File("main.db"), "rw"))) {
     // init the db
-    var core = new CoreBufferedFile(raf);
     var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
     var db = new Database(core, hasher);
 
@@ -121,6 +120,8 @@ A `Database` is initialized with an implementation of the `Core` interface, whic
 * `CoreBufferedFile` databases, like in the example above, write to a file while using an in-memory buffer to dramatically improve performance. This is highly recommended if you want to create a file-based database.
 * `CoreFile` databases use no buffering when reading and writing data. You can initialize it like in the example above, except with a `RandomAccessFile` instance. This is almost never necessary but it's useful as a benchmark comparison with `CoreBufferedFile` databases.
 * `CoreMemory` databases work completely in memory. You can initialize it like in the example above, except with a `RandomAccessMemory` instance.
+
+Every `Core` implements `AutoCloseable` and owns the file or memory passed to its constructor. Use try-with-resources on the core rather than on the underlying resource so buffered data is flushed before the resource is closed.
 
 Usually, you want to use a top-level `ArrayList` like in the example above, because that allows you to store a reference to each copy of the database (which I call a "moment"). This is how it supports transactions, despite not having any rollback journal or write-ahead log. It's an append-only database, so the data you are writing is invisible to any reader until the very last step, when the top-level list's header is updated.
 
@@ -496,8 +497,7 @@ The hashing data structures will create the hash for you when you call methods l
 When initializing a database, you tell xitdb how to hash with the `Hasher`. If you're using SHA-1, it will look like this:
 
 ```java
-try (var raf = new RandomAccessFile(new File("main.db"), "rw")) {
-    var core = new CoreFile(raf);
+try (var core = new CoreFile(new RandomAccessFile(new File("main.db"), "rw"))) {
     var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
     var db = new Database(core, hasher);
     // ...
@@ -546,8 +546,7 @@ assertEquals("SHA-1", hasher.md().getAlgorithm());
 Normally, an immutable database grows forever, because old data is never deleted. To reclaim disk space and clear the history, xitdb supports compaction. This involves completely rebuilding the database file to only contain the data accessible from the latest copy (i.e., "moment") of the database.
 
 ```java
-try (var compactFile = new RandomAccessBufferedFile(new File("compact.db"), "rw")) {
-    var compactCore = new CoreBufferedFile(compactFile);
+try (var compactCore = new CoreBufferedFile(new RandomAccessBufferedFile(new File("compact.db"), "rw"))) {
     var compactDb = db.compact(compactCore);
 
     // read from the new compacted db

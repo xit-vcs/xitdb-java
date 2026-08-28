@@ -21,8 +21,7 @@ class HighLevelDatabaseTest {
 
     @Test
     void testHightLevelApi() throws Exception {
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             testHighLevelApi(core, hasher, null);
         }
@@ -31,8 +30,7 @@ class HighLevelDatabaseTest {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
 
-            try (var raf = new RandomAccessFile(file, "rw")) {
-                var core = new CoreFile(raf);
+            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testHighLevelApi(core, hasher, file);
             }
@@ -42,8 +40,7 @@ class HighLevelDatabaseTest {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
 
-            try (var raf = new RandomAccessBufferedFile(file, "rw")) {
-                var core = new CoreBufferedFile(raf);
+            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testHighLevelApi(core, hasher, file);
             }
@@ -60,8 +57,7 @@ class HighLevelDatabaseTest {
         // the data is just created and immediately sent over the wire.
 
         // hash map
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             var db = new Database(core, hasher);
 
@@ -85,8 +81,7 @@ class HighLevelDatabaseTest {
         }
 
         // linked array list is not currently allowed at the top level
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             var db = new Database(core, hasher);
 
@@ -98,8 +93,7 @@ class HighLevelDatabaseTest {
     void testReadDatabaseFromResources() throws Exception {
         var resource = getClass().getClassLoader().getResource("test.db");
         File file = new File(resource.toURI());
-        try (var raf = new RandomAccessFile(file, "r")) {
-            var core = new CoreFile(raf);
+        try (var core = new CoreFile(new RandomAccessFile(file, "r"))) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             var db = new Database(core, hasher);
             var history = new ReadArrayList(db.rootCursor());
@@ -270,8 +264,7 @@ class HighLevelDatabaseTest {
             @Override
             protected Database initialValue() {
                 try {
-                    var raf = new RandomAccessFile(file, "r");
-                    var core = new CoreFile(raf);
+                    var core = new CoreFile(new RandomAccessFile(file, "r"));
                     var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                     return new Database(core, hasher);
                 } catch (Exception e) {
@@ -291,7 +284,7 @@ class HighLevelDatabaseTest {
                     var fooValue = fooCursor.readBytes(MAX_READ_BYTES);
                     assertEquals("foo", new String(fooValue));
                     // close the db file
-                    ((CoreFile)db.get().core).file.close();
+                    db.get().core.close();
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
@@ -309,7 +302,7 @@ class HighLevelDatabaseTest {
                     var fooValue = fooCursor.readBytes(MAX_READ_BYTES);
                     assertEquals("foo", new String(fooValue));
                     // close the db file
-                    ((CoreFile)db.get().core).file.close();
+                    db.get().core.close();
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
@@ -338,7 +331,7 @@ class HighLevelDatabaseTest {
         t2.join();
 
         // close the db file
-        ((CoreFile)db.get().core).file.close();
+        db.get().core.close();
     }
 
     void testHighLevelApi(Core core, Hasher hasher, File fileMaybe) throws Exception {
@@ -753,8 +746,8 @@ class HighLevelDatabaseTest {
 
             // no error is thrown if db file is opened in read-only mode
             if (fileMaybe != null) {
-                try (var raf = new RandomAccessFile(fileMaybe, "r")) {
-                    new Database(new CoreFile(raf), hasher);
+                try (var readOnlyCore = new CoreFile(new RandomAccessFile(fileMaybe, "r"))) {
+                    new Database(readOnlyCore, hasher);
                 }
             }
 
@@ -983,11 +976,9 @@ class HighLevelDatabaseTest {
     @Test
     void testCompaction() throws Exception {
         // memory
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            try (var targetRam = new RandomAccessMemory()) {
-                var targetCore = new CoreMemory(targetRam);
+            try (var targetCore = new CoreMemory(new RandomAccessMemory())) {
                 testCompaction(core, targetCore, hasher, null, null);
             }
         }
@@ -999,10 +990,8 @@ class HighLevelDatabaseTest {
             var targetFile = File.createTempFile("compact_target", ".db");
             targetFile.deleteOnExit();
 
-            try (var sourceRaf = new RandomAccessFile(sourceFile, "rw");
-                 var targetRaf = new RandomAccessFile(targetFile, "rw")) {
-                var sourceCore = new CoreFile(sourceRaf);
-                var targetCore = new CoreFile(targetRaf);
+            try (var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
+                 var targetCore = new CoreFile(new RandomAccessFile(targetFile, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
             }
@@ -1015,10 +1004,8 @@ class HighLevelDatabaseTest {
             var targetFile = File.createTempFile("compact_target", ".db");
             targetFile.deleteOnExit();
 
-            try (var sourceRaf = new RandomAccessBufferedFile(sourceFile, "rw");
-                 var targetRaf = new RandomAccessBufferedFile(targetFile, "rw")) {
-                var sourceCore = new CoreBufferedFile(sourceRaf);
-                var targetCore = new CoreBufferedFile(targetRaf);
+            try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
+                 var targetCore = new CoreBufferedFile(new RandomAccessBufferedFile(targetFile, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
             }
@@ -1029,10 +1016,8 @@ class HighLevelDatabaseTest {
             var sourceFile = File.createTempFile("compact_source", ".db");
             sourceFile.deleteOnExit();
 
-            try (var sourceRaf = new RandomAccessBufferedFile(sourceFile, "rw");
-                 var targetRam = new RandomAccessMemory()) {
-                var sourceCore = new CoreBufferedFile(sourceRaf);
-                var targetCore = new CoreMemory(targetRam);
+            try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
+                 var targetCore = new CoreMemory(new RandomAccessMemory())) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testCompaction(sourceCore, targetCore, hasher, sourceFile, null);
             }
@@ -1376,8 +1361,7 @@ class HighLevelDatabaseTest {
 
     @Test
     void testSortedMap() throws Exception {
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             testSortedMap(core, hasher);
         }
@@ -1385,8 +1369,7 @@ class HighLevelDatabaseTest {
         {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
-            try (var raf = new RandomAccessFile(file, "rw")) {
-                var core = new CoreFile(raf);
+            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testSortedMap(core, hasher);
             }
@@ -1395,8 +1378,7 @@ class HighLevelDatabaseTest {
         {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
-            try (var raf = new RandomAccessBufferedFile(file, "rw")) {
-                var core = new CoreBufferedFile(raf);
+            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testSortedMap(core, hasher);
             }
@@ -1613,8 +1595,7 @@ class HighLevelDatabaseTest {
 
     @Test
     void testIteratorFrom() throws Exception {
-        try (var ram = new RandomAccessMemory()) {
-            var core = new CoreMemory(ram);
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             testIteratorFrom(core, hasher);
         }
@@ -1622,8 +1603,7 @@ class HighLevelDatabaseTest {
         {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
-            try (var raf = new RandomAccessFile(file, "rw")) {
-                var core = new CoreFile(raf);
+            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testIteratorFrom(core, hasher);
             }
@@ -1632,8 +1612,7 @@ class HighLevelDatabaseTest {
         {
             var file = File.createTempFile("database", "");
             file.deleteOnExit();
-            try (var raf = new RandomAccessBufferedFile(file, "rw")) {
-                var core = new CoreBufferedFile(raf);
+            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
                 testIteratorFrom(core, hasher);
             }

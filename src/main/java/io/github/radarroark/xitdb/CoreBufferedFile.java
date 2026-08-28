@@ -50,4 +50,9 @@ public class CoreBufferedFile implements Core {
     public void sync() throws IOException {
         this.file.sync();
     }
+
+    @Override
+    public void close() throws IOException {
+        this.file.close();
+    }
 }

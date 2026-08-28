@@ -48,4 +48,9 @@ public class CoreMemory implements Core {
     @Override
     public void sync() throws IOException {
     }
+
+    @Override
+    public void close() throws IOException {
+        this.memory.close();
+    }
 }

@@ -50,4 +50,9 @@ public class CoreFile implements Core {
     public void sync() throws IOException {
         this.file.getFD().sync();
     }
+
+    @Override
+    public void close() throws IOException {
+        this.file.close();
+    }
 }

@@ -73,7 +73,7 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
     // AutoCloseable
 
     @Override
-    public void close() throws Exception {
+    public void close() throws IOException {
         flush();
         this.file.close();
         this.memory.close();
