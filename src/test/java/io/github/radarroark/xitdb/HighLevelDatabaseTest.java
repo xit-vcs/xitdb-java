@@ -1132,6 +1132,18 @@ class HighLevelDatabaseTest {
                 history.appendContext(history.getSlot(-1), (cursor) -> {
                     var moment = new WriteHashMap(cursor);
                     moment.put("key1", new Database.Bytes("final_value"));
+
+                    // cycles must survive compaction rather than causing the
+                    // remapper to recurse indefinitely.
+                    moment.put("self", moment.slot());
+
+                    var cyclicList = new WriteArrayList(moment.putCursor("cyclic-list"));
+                    cyclicList.append(cyclicList.slot());
+
+                    var mapA = new WriteHashMap(moment.putCursor("map-a"));
+                    var mapB = new WriteHashMap(moment.putCursor("map-b"));
+                    mapA.put("map-b", mapB.slot());
+                    mapB.put("map-a", mapA.slot());
                 });
             }
 
@@ -1152,6 +1164,21 @@ class HighLevelDatabaseTest {
             // verify all data from latest moment is correct
             var momentCursor = history.getCursor(0);
             var moment = new ReadHashMap(momentCursor);
+
+            // self-references and mutual references point back to the same compacted
+            // objects rather than duplicate objects or dangling source offsets.
+            var selfCursor = moment.getCursor("self");
+            assertEquals(momentCursor.slot(), selfCursor.slot());
+
+            var cyclicListCursor = moment.getCursor("cyclic-list");
+            var cyclicList = new ReadArrayList(cyclicListCursor);
+            assertEquals(cyclicListCursor.slot(), cyclicList.getSlot(0));
+
+            var mapACursor = moment.getCursor("map-a");
+            var mapA = new ReadHashMap(mapACursor);
+            var mapBCursor = mapA.getCursor("map-b");
+            var mapB = new ReadHashMap(mapBCursor);
+            assertEquals(mapACursor.slot(), mapB.getSlot("map-a"));
 
             // key1 should have the final value
             assertEquals("final_value", new String(moment.getCursor("key1").readBytes(MAX_READ_BYTES)));

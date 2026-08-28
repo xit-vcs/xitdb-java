@@ -2665,6 +2665,13 @@ public class Database {
 
     // compaction helpers
 
+    private static long reserveBlock(Core targetCore, int size) throws IOException {
+        var offset = targetCore.length();
+        targetCore.seek(offset);
+        targetCore.writer().write(new byte[size]);
+        return offset;
+    }
+
     private static Slot remapSlot(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
         switch (slot.tag()) {
             case NONE, UINT, INT, FLOAT, SHORT_BYTES -> {
@@ -2673,64 +2680,56 @@ public class Database {
             case BYTES -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapBytes(sourceCore, targetCore, slot);
-                offsetMap.put(slot.value(), newOffset);
+                var newOffset = remapBytes(sourceCore, targetCore, offsetMap, slot);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case INDEX -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapIndex(sourceCore, targetCore, hashSize, offsetMap, slot);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case ARRAY_LIST -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapArrayList(sourceCore, targetCore, hashSize, offsetMap, slot);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case LINKED_ARRAY_LIST -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapBTree(sourceCore, targetCore, hashSize, offsetMap, slot);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case HASH_MAP, HASH_SET -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapHashMapOrSet(sourceCore, targetCore, hashSize, offsetMap, slot, false);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapHashMapOrSet(sourceCore, targetCore, hashSize, offsetMap, slot, true);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case KV_PAIR -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapKvPair(sourceCore, targetCore, hashSize, offsetMap, slot);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             case SORTED_MAP, SORTED_SET -> {
                 var mapped = offsetMap.get(slot.value());
                 if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
                 var newOffset = remapSortedMap(sourceCore, targetCore, hashSize, offsetMap, slot);
-                offsetMap.put(slot.value(), newOffset);
                 return new Slot(newOffset, slot.tag(), slot.full());
             }
             default -> throw new UnexpectedTagException();
         }
     }
 
-    private static long remapBytes(Core sourceCore, Core targetCore, Slot slot) throws IOException {
+    private static long remapBytes(Core sourceCore, Core targetCore, HashMap<Long, Long> offsetMap, Slot slot) throws IOException {
         sourceCore.seek(slot.value());
         var sourceReader = sourceCore.reader();
         var length = sourceReader.readLong();
@@ -2754,6 +2753,7 @@ public class Database {
             remaining -= chunk;
         }
 
+        offsetMap.put(slot.value(), newOffset);
         return newOffset;
     }
 
@@ -2763,6 +2763,9 @@ public class Database {
         var sourceReader = sourceCore.reader();
         var blockBytes = new byte[INDEX_BLOCK_SIZE];
         sourceReader.readFully(blockBytes);
+
+        var newOffset = reserveBlock(targetCore, INDEX_BLOCK_SIZE);
+        offsetMap.put(slot.value(), newOffset);
 
         // remap each slot
         var buffer = ByteBuffer.wrap(blockBytes);
@@ -2775,7 +2778,6 @@ public class Database {
         }
 
         // write remapped block to target
-        var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
         for (var s : remappedSlots) {
@@ -2793,12 +2795,14 @@ public class Database {
         sourceReader.readFully(headerBytes);
         var header = ArrayListHeader.fromBytes(headerBytes);
 
+        var newOffset = reserveBlock(targetCore, ArrayListHeader.length);
+        offsetMap.put(slot.value(), newOffset);
+
         // remap root index block pointer via remapSlot as an .index slot
         var indexSlot = new Slot(header.ptr(), Tag.INDEX);
         var remappedIndex = remapSlot(sourceCore, targetCore, hashSize, offsetMap, indexSlot);
 
         // write new ArrayListHeader with remapped ptr
-        var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
         targetWriter.write(new ArrayListHeader(remappedIndex.value(), header.size()).toBytes());
@@ -2813,9 +2817,11 @@ public class Database {
         sourceReader.readFully(headerBytes);
         var header = BTreeHeader.fromBytes(headerBytes);
 
+        var newOffset = reserveBlock(targetCore, BTreeHeader.length);
+        offsetMap.put(slot.value(), newOffset);
+
         var remappedRoot = remapBTreeNode(sourceCore, targetCore, hashSize, offsetMap, header.rootPtr());
 
-        var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
         targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
@@ -2838,12 +2844,16 @@ public class Database {
         if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
         var kind = BTreeNodeKind.values()[kindInt];
         var num = nodeHeader[1] & 0xFF;
+        if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
 
         switch (kind) {
             case LEAF -> {
                 var body = new byte[Slot.length * BTREE_SLOT_COUNT];
                 sourceReader.readFully(body);
                 var buffer = ByteBuffer.wrap(body);
+
+                var newOffset = reserveBlock(targetCore, BTREE_LEAF_BLOCK_SIZE);
+                offsetMap.put(nodeOffset, newOffset);
 
                 var slots = new Slot[BTREE_SLOT_COUNT];
                 for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
@@ -2853,20 +2863,21 @@ public class Database {
                     slots[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, valueSlot);
                 }
 
-                var newOffset = targetCore.length();
                 targetCore.seek(newOffset);
                 var targetWriter = targetCore.writer();
                 targetWriter.writeByte(kindInt);
                 targetWriter.writeByte(num);
                 for (var s : slots) targetWriter.write(s.toBytes());
 
-                offsetMap.put(nodeOffset, newOffset);
                 return newOffset;
             }
             case BRANCH -> {
                 var body = new byte[(Slot.length + 8) * BTREE_SLOT_COUNT];
                 sourceReader.readFully(body);
                 var buffer = ByteBuffer.wrap(body);
+
+                var newOffset = reserveBlock(targetCore, BTREE_BRANCH_BLOCK_SIZE);
+                offsetMap.put(nodeOffset, newOffset);
 
                 var children = new Slot[BTREE_SLOT_COUNT];
                 for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
@@ -2883,7 +2894,6 @@ public class Database {
                 var counts = new long[BTREE_SLOT_COUNT];
                 for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
 
-                var newOffset = targetCore.length();
                 targetCore.seek(newOffset);
                 var targetWriter = targetCore.writer();
                 targetWriter.writeByte(kindInt);
@@ -2891,7 +2901,6 @@ public class Database {
                 for (var s : children) targetWriter.write(s.toBytes());
                 for (var c : counts) targetWriter.writeLong(c);
 
-                offsetMap.put(nodeOffset, newOffset);
                 return newOffset;
             }
         }
@@ -2905,9 +2914,11 @@ public class Database {
         sourceReader.readFully(headerBytes);
         var header = BTreeHeader.fromBytes(headerBytes);
 
+        var newOffset = reserveBlock(targetCore, BTreeHeader.length);
+        offsetMap.put(slot.value(), newOffset);
+
         var remappedRoot = remapSortedMapNode(sourceCore, targetCore, hashSize, offsetMap, header.rootPtr());
 
-        var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
         targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
@@ -2927,12 +2938,16 @@ public class Database {
         if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
         var kind = BTreeNodeKind.values()[kindInt];
         var num = nodeHeader[1] & 0xFF;
+        if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
 
         switch (kind) {
             case LEAF -> {
                 var body = new byte[Slot.length * BTREE_SLOT_COUNT];
                 sourceReader.readFully(body);
                 var buffer = ByteBuffer.wrap(body);
+
+                var newOffset = reserveBlock(targetCore, SORTED_LEAF_BLOCK_SIZE);
+                offsetMap.put(nodeOffset, newOffset);
 
                 var entries = new Slot[BTREE_SLOT_COUNT];
                 for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
@@ -2942,20 +2957,21 @@ public class Database {
                     entries[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, entry);
                 }
 
-                var newOffset = targetCore.length();
                 targetCore.seek(newOffset);
                 var targetWriter = targetCore.writer();
                 targetWriter.writeByte(kindInt);
                 targetWriter.writeByte(num);
                 for (var s : entries) targetWriter.write(s.toBytes());
 
-                offsetMap.put(nodeOffset, newOffset);
                 return newOffset;
             }
             case BRANCH -> {
                 var body = new byte[(Slot.length * 2 + 8) * BTREE_SLOT_COUNT];
                 sourceReader.readFully(body);
                 var buffer = ByteBuffer.wrap(body);
+
+                var newOffset = reserveBlock(targetCore, SORTED_BRANCH_BLOCK_SIZE);
+                offsetMap.put(nodeOffset, newOffset);
 
                 var children = new Slot[BTREE_SLOT_COUNT];
                 for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
@@ -2979,7 +2995,6 @@ public class Database {
                 var counts = new long[BTREE_SLOT_COUNT];
                 for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
 
-                var newOffset = targetCore.length();
                 targetCore.seek(newOffset);
                 var targetWriter = targetCore.writer();
                 targetWriter.writeByte(kindInt);
@@ -2988,7 +3003,6 @@ public class Database {
                 for (var s : separators) targetWriter.write(s.toBytes());
                 for (var c : counts) targetWriter.writeLong(c);
 
-                offsetMap.put(nodeOffset, newOffset);
                 return newOffset;
             }
         }
@@ -3008,6 +3022,9 @@ public class Database {
         var blockBytes = new byte[INDEX_BLOCK_SIZE];
         sourceReader.readFully(blockBytes);
 
+        var newOffset = reserveBlock(targetCore, INDEX_BLOCK_SIZE + (counted ? 8 : 0));
+        offsetMap.put(slot.value(), newOffset);
+
         // remap each child slot in the block
         var buffer = ByteBuffer.wrap(blockBytes);
         var remappedSlots = new Slot[SLOT_COUNT];
@@ -3019,7 +3036,6 @@ public class Database {
         }
 
         // write [optional count][remapped block] contiguously to target
-        var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
         if (counted) {
@@ -3040,12 +3056,14 @@ public class Database {
         sourceReader.readFully(kvPairBytes);
         var kvPair = KeyValuePair.fromBytes(kvPairBytes, hashSize);
 
+        var newOffset = reserveBlock(targetCore, KeyValuePair.length(hashSize));
+        offsetMap.put(slot.value(), newOffset);
+
         // remap key_slot and value_slot
         var remappedKey = remapSlot(sourceCore, targetCore, hashSize, offsetMap, kvPair.keySlot());
         var remappedValue = remapSlot(sourceCore, targetCore, hashSize, offsetMap, kvPair.valueSlot());
 
         // write remapped KV pair (hash stays unchanged)
-        var newOffset = targetCore.length();
         targetCore.seek(newOffset);
         var targetWriter = targetCore.writer();
         targetWriter.write(new KeyValuePair(remappedValue, remappedKey, kvPair.hash()).toBytes());
