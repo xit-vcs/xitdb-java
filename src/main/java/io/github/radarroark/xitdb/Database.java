@@ -156,24 +156,26 @@ public class Database {
     private void truncate() throws IOException {
         if (this.header.tag() != Tag.ARRAY_LIST) return;
 
-        var rootCursor = rootCursor();
-        var listSize = rootCursor.count();
-
-        if (listSize == 0) return;
-
-        this.core.seek(DATABASE_START + ArrayListHeader.length);
+        this.core.seek(DATABASE_START);
         var reader = this.core.reader();
-        var headerFileSize = reader.readLong();
+        var headerBytes = new byte[TopLevelArrayListHeader.length];
+        reader.readFully(headerBytes);
+        var header = TopLevelArrayListHeader.fromBytes(headerBytes);
 
-        if (headerFileSize == 0) return;
+        var minimumSize = DATABASE_START + TopLevelArrayListHeader.length + INDEX_BLOCK_SIZE;
+        var committedSize = header.fileSize() == 0 ? minimumSize : header.fileSize();
+
+        if (header.fileSize() == 0 && header.parent().size() != 0) throw new InvalidDatabaseException();
+        if (committedSize < minimumSize) throw new InvalidDatabaseException();
 
         var fileSize = this.core.length();
 
-        if (fileSize == headerFileSize) return;
+        if (fileSize < committedSize) throw new TruncatedDatabaseException();
+        if (fileSize == committedSize) return;
 
         // ignore error because the file may be open in read-only mode
         try {
-            this.core.setLength(headerFileSize);
+            this.core.setLength(committedSize);
         } catch (IOException e) {}
     }
 
@@ -309,6 +311,15 @@ public class Database {
             buffer.put(this.parent.toBytes());
             buffer.putLong(this.fileSize);
             return buffer.array();
+        }
+
+        public static TopLevelArrayListHeader fromBytes(byte[] bytes) {
+            var buffer = ByteBuffer.wrap(bytes);
+            var parentBytes = new byte[ArrayListHeader.length];
+            buffer.get(parentBytes);
+            var parent = ArrayListHeader.fromBytes(parentBytes);
+            var fileSize = checkLong(buffer.getLong());
+            return new TopLevelArrayListHeader(fileSize, parent);
         }
     }
     public static record KeyValuePair(Slot valueSlot, Slot keySlot, byte[] hash) {
@@ -1369,6 +1380,7 @@ public class Database {
     public static class NotImplementedException extends DatabaseException {}
     public static class UnreachableException extends DatabaseException {}
     public static class InvalidDatabaseException extends DatabaseException {}
+    public static class TruncatedDatabaseException extends DatabaseException {}
     public static class InvalidVersionException extends DatabaseException {}
     public static class InvalidHashSizeException extends DatabaseException {}
     public static class KeyNotFoundException extends DatabaseException {}
