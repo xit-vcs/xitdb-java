@@ -126,7 +126,8 @@ public class Database {
         targetWriter.write(new byte[INDEX_BLOCK_SIZE]);
 
         // recursively remap the moment slot
-        var remappedMoment = remapSlot(this.core, target.core, this.header.hashSize(), offsetMap, momentSlot);
+        var compactor = new Compactor(this.core, target.core, this.header.hashSize(), offsetMap);
+        var remappedMoment = compactor.remapSlot(momentSlot);
 
         // write remapped moment slot into position 0 of target's root index block
         target.core.seek(targetArrayListPtr);
@@ -2665,409 +2666,400 @@ public class Database {
 
     // compaction helpers
 
-    private static long reserveBlock(Core targetCore, int size) throws IOException {
-        var offset = targetCore.length();
-        targetCore.seek(offset);
-        targetCore.writer().write(new byte[size]);
-        return offset;
+    @FunctionalInterface
+    private interface ObjectPopulator {
+        void populate(long sourceOffset, long targetOffset) throws Exception;
     }
 
-    private static Slot remapSlot(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        switch (slot.tag()) {
-            case NONE, UINT, INT, FLOAT, SHORT_BYTES -> {
-                return slot;
-            }
-            case BYTES -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapBytes(sourceCore, targetCore, offsetMap, slot);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case INDEX -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapIndex(sourceCore, targetCore, hashSize, offsetMap, slot);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case ARRAY_LIST -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapArrayList(sourceCore, targetCore, hashSize, offsetMap, slot);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case LINKED_ARRAY_LIST -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapBTree(sourceCore, targetCore, hashSize, offsetMap, slot);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case HASH_MAP, HASH_SET -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapHashMapOrSet(sourceCore, targetCore, hashSize, offsetMap, slot, false);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapHashMapOrSet(sourceCore, targetCore, hashSize, offsetMap, slot, true);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case KV_PAIR -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapKvPair(sourceCore, targetCore, hashSize, offsetMap, slot);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            case SORTED_MAP, SORTED_SET -> {
-                var mapped = offsetMap.get(slot.value());
-                if (mapped != null) return new Slot(mapped, slot.tag(), slot.full());
-                var newOffset = remapSortedMap(sourceCore, targetCore, hashSize, offsetMap, slot);
-                return new Slot(newOffset, slot.tag(), slot.full());
-            }
-            default -> throw new UnexpectedTagException();
-        }
-    }
+    private static class Compactor {
+        private final Core sourceCore;
+        private final Core targetCore;
+        private final short hashSize;
+        private final HashMap<Long, Long> offsetMap;
 
-    private static long remapBytes(Core sourceCore, Core targetCore, HashMap<Long, Long> offsetMap, Slot slot) throws IOException {
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
-        var length = sourceReader.readLong();
-
-        // total size: long length + bytes + optional 2-byte format_tag
-        var formatTagSize = slot.full() ? 2 : 0;
-        var totalPayload = length + formatTagSize;
-
-        var newOffset = targetCore.length();
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        targetWriter.writeLong(length);
-
-        // copy bytes in chunks
-        var remaining = totalPayload;
-        while (remaining > 0) {
-            var chunk = (int) Math.min(remaining, 4096);
-            var buf = new byte[chunk];
-            sourceReader.readFully(buf);
-            targetWriter.write(buf);
-            remaining -= chunk;
+        private Compactor(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap) {
+            this.sourceCore = sourceCore;
+            this.targetCore = targetCore;
+            this.hashSize = hashSize;
+            this.offsetMap = offsetMap;
         }
 
-        offsetMap.put(slot.value(), newOffset);
-        return newOffset;
-    }
-
-    private static long remapIndex(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        // read 144-byte block (16 slots)
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
-        var blockBytes = new byte[INDEX_BLOCK_SIZE];
-        sourceReader.readFully(blockBytes);
-
-        var newOffset = reserveBlock(targetCore, INDEX_BLOCK_SIZE);
-        offsetMap.put(slot.value(), newOffset);
-
-        // remap each slot
-        var buffer = ByteBuffer.wrap(blockBytes);
-        var remappedSlots = new Slot[SLOT_COUNT];
-        for (int i = 0; i < SLOT_COUNT; i++) {
-            var slotBytes = new byte[Slot.length];
-            buffer.get(slotBytes);
-            var childSlot = Slot.fromBytes(slotBytes);
-            remappedSlots[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, childSlot);
+        private long reserveBlock(int size) throws IOException {
+            var offset = targetCore.length();
+            targetCore.seek(offset);
+            targetCore.writer().write(new byte[size]);
+            return offset;
         }
 
-        // write remapped block to target
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        for (var s : remappedSlots) {
-            targetWriter.write(s.toBytes());
+        private long visitObject(long sourceOffset, int size, ObjectPopulator populate) throws Exception {
+            var targetOffset = offsetMap.get(sourceOffset);
+            if (targetOffset != null) return targetOffset;
+
+            targetOffset = reserveBlock(size);
+            offsetMap.put(sourceOffset, targetOffset);
+            populate.populate(sourceOffset, targetOffset);
+            return targetOffset;
         }
 
-        return newOffset;
-    }
-
-    private static long remapArrayList(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        // read ArrayListHeader (16 bytes)
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
-        var headerBytes = new byte[ArrayListHeader.length];
-        sourceReader.readFully(headerBytes);
-        var header = ArrayListHeader.fromBytes(headerBytes);
-
-        var newOffset = reserveBlock(targetCore, ArrayListHeader.length);
-        offsetMap.put(slot.value(), newOffset);
-
-        // remap root index block pointer via remapSlot as an .index slot
-        var indexSlot = new Slot(header.ptr(), Tag.INDEX);
-        var remappedIndex = remapSlot(sourceCore, targetCore, hashSize, offsetMap, indexSlot);
-
-        // write new ArrayListHeader with remapped ptr
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        targetWriter.write(new ArrayListHeader(remappedIndex.value(), header.size()).toBytes());
-
-        return newOffset;
-    }
-
-    private static long remapBTree(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
-        var headerBytes = new byte[BTreeHeader.length];
-        sourceReader.readFully(headerBytes);
-        var header = BTreeHeader.fromBytes(headerBytes);
-
-        var newOffset = reserveBlock(targetCore, BTreeHeader.length);
-        offsetMap.put(slot.value(), newOffset);
-
-        var remappedRoot = remapBTreeNode(sourceCore, targetCore, hashSize, offsetMap, header.rootPtr());
-
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
-
-        return newOffset;
-    }
-
-    private static long remapBTreeNode(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, long nodeOffset) throws Exception {
-        // dedup check (subtrees are shared by pointer)
-        var mapped = offsetMap.get(nodeOffset);
-        if (mapped != null) return mapped;
-
-        // read the whole node into memory first, so the recursion below can freely
-        // create its own readers/writers
-        sourceCore.seek(nodeOffset);
-        var sourceReader = sourceCore.reader();
-        var nodeHeader = new byte[BTREE_NODE_HEADER_SIZE];
-        sourceReader.readFully(nodeHeader);
-        var kindInt = nodeHeader[0] & 0xFF;
-        if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
-        var kind = BTreeNodeKind.values()[kindInt];
-        var num = nodeHeader[1] & 0xFF;
-        if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
-
-        switch (kind) {
-            case LEAF -> {
-                var body = new byte[Slot.length * BTREE_SLOT_COUNT];
-                sourceReader.readFully(body);
-                var buffer = ByteBuffer.wrap(body);
-
-                var newOffset = reserveBlock(targetCore, BTREE_LEAF_BLOCK_SIZE);
-                offsetMap.put(nodeOffset, newOffset);
-
-                var slots = new Slot[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
-                    var slotBytes = new byte[Slot.length];
-                    buffer.get(slotBytes);
-                    var valueSlot = Slot.fromBytes(slotBytes);
-                    slots[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, valueSlot);
+        private Slot remapSlot(Slot slot) throws Exception {
+            switch (slot.tag()) {
+                case NONE, UINT, INT, FLOAT, SHORT_BYTES -> {
+                    return slot;
                 }
-
-                targetCore.seek(newOffset);
-                var targetWriter = targetCore.writer();
-                targetWriter.writeByte(kindInt);
-                targetWriter.writeByte(num);
-                for (var s : slots) targetWriter.write(s.toBytes());
-
-                return newOffset;
-            }
-            case BRANCH -> {
-                var body = new byte[(Slot.length + 8) * BTREE_SLOT_COUNT];
-                sourceReader.readFully(body);
-                var buffer = ByteBuffer.wrap(body);
-
-                var newOffset = reserveBlock(targetCore, BTREE_BRANCH_BLOCK_SIZE);
-                offsetMap.put(nodeOffset, newOffset);
-
-                var children = new Slot[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
-                    var slotBytes = new byte[Slot.length];
-                    buffer.get(slotBytes);
-                    var child = Slot.fromBytes(slotBytes);
-                    if (child.tag() == Tag.INDEX) {
-                        var remappedPtr = remapBTreeNode(sourceCore, targetCore, hashSize, offsetMap, child.value());
-                        children[i] = new Slot(remappedPtr, Tag.INDEX, child.full());
-                    } else {
-                        children[i] = child;
-                    }
+                case BYTES -> {
+                    var newOffset = remapBytes(slot);
+                    return new Slot(newOffset, slot.tag(), slot.full());
                 }
-                var counts = new long[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
-
-                targetCore.seek(newOffset);
-                var targetWriter = targetCore.writer();
-                targetWriter.writeByte(kindInt);
-                targetWriter.writeByte(num);
-                for (var s : children) targetWriter.write(s.toBytes());
-                for (var c : counts) targetWriter.writeLong(c);
-
-                return newOffset;
+                case INDEX -> {
+                    var newOffset = visitObject(slot.value(), INDEX_BLOCK_SIZE, this::populateIndex);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                case ARRAY_LIST -> {
+                    var newOffset = visitObject(slot.value(), ArrayListHeader.length, this::populateArrayList);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                case LINKED_ARRAY_LIST -> {
+                    var newOffset = visitObject(slot.value(), BTreeHeader.length, this::populateBTree);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                case HASH_MAP, HASH_SET -> {
+                    var newOffset = visitObject(slot.value(), INDEX_BLOCK_SIZE, this::populateHashMapOrSet);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                case COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
+                    var newOffset = visitObject(slot.value(), INDEX_BLOCK_SIZE + 8, this::populateCountedHashMapOrSet);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                case KV_PAIR -> {
+                    var newOffset = visitObject(slot.value(), KeyValuePair.length(hashSize), this::populateKvPair);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                case SORTED_MAP, SORTED_SET -> {
+                    var newOffset = visitObject(slot.value(), BTreeHeader.length, this::populateSortedMap);
+                    return new Slot(newOffset, slot.tag(), slot.full());
+                }
+                default -> throw new UnexpectedTagException();
             }
         }
-        throw new UnreachableException();
-    }
 
-    private static long remapSortedMap(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
-        var headerBytes = new byte[BTreeHeader.length];
-        sourceReader.readFully(headerBytes);
-        var header = BTreeHeader.fromBytes(headerBytes);
+        private long remapBytes(Slot slot) throws IOException {
+            var mapped = offsetMap.get(slot.value());
+            if (mapped != null) return mapped;
 
-        var newOffset = reserveBlock(targetCore, BTreeHeader.length);
-        offsetMap.put(slot.value(), newOffset);
+            sourceCore.seek(slot.value());
+            var sourceReader = sourceCore.reader();
+            var length = sourceReader.readLong();
 
-        var remappedRoot = remapSortedMapNode(sourceCore, targetCore, hashSize, offsetMap, header.rootPtr());
+            // total size: long length + bytes + optional 2-byte format_tag
+            var formatTagSize = slot.full() ? 2 : 0;
+            var totalPayload = length + formatTagSize;
 
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
+            var newOffset = targetCore.length();
+            targetCore.seek(newOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.writeLong(length);
 
-        return newOffset;
-    }
-
-    private static long remapSortedMapNode(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, long nodeOffset) throws Exception {
-        var mapped = offsetMap.get(nodeOffset);
-        if (mapped != null) return mapped;
-
-        sourceCore.seek(nodeOffset);
-        var sourceReader = sourceCore.reader();
-        var nodeHeader = new byte[BTREE_NODE_HEADER_SIZE];
-        sourceReader.readFully(nodeHeader);
-        var kindInt = nodeHeader[0] & 0xFF;
-        if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
-        var kind = BTreeNodeKind.values()[kindInt];
-        var num = nodeHeader[1] & 0xFF;
-        if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
-
-        switch (kind) {
-            case LEAF -> {
-                var body = new byte[Slot.length * BTREE_SLOT_COUNT];
-                sourceReader.readFully(body);
-                var buffer = ByteBuffer.wrap(body);
-
-                var newOffset = reserveBlock(targetCore, SORTED_LEAF_BLOCK_SIZE);
-                offsetMap.put(nodeOffset, newOffset);
-
-                var entries = new Slot[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
-                    var slotBytes = new byte[Slot.length];
-                    buffer.get(slotBytes);
-                    var entry = Slot.fromBytes(slotBytes);
-                    entries[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, entry);
-                }
-
-                targetCore.seek(newOffset);
-                var targetWriter = targetCore.writer();
-                targetWriter.writeByte(kindInt);
-                targetWriter.writeByte(num);
-                for (var s : entries) targetWriter.write(s.toBytes());
-
-                return newOffset;
+            // copy bytes in chunks
+            var remaining = totalPayload;
+            while (remaining > 0) {
+                var chunk = (int) Math.min(remaining, 4096);
+                var buf = new byte[chunk];
+                sourceReader.readFully(buf);
+                targetWriter.write(buf);
+                remaining -= chunk;
             }
-            case BRANCH -> {
-                var body = new byte[(Slot.length * 2 + 8) * BTREE_SLOT_COUNT];
-                sourceReader.readFully(body);
-                var buffer = ByteBuffer.wrap(body);
 
-                var newOffset = reserveBlock(targetCore, SORTED_BRANCH_BLOCK_SIZE);
-                offsetMap.put(nodeOffset, newOffset);
+            offsetMap.put(slot.value(), newOffset);
+            return newOffset;
+        }
 
-                var children = new Slot[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
-                    var slotBytes = new byte[Slot.length];
-                    buffer.get(slotBytes);
-                    var child = Slot.fromBytes(slotBytes);
-                    if (child.tag() == Tag.INDEX) {
-                        var remappedPtr = remapSortedMapNode(sourceCore, targetCore, hashSize, offsetMap, child.value());
-                        children[i] = new Slot(remappedPtr, Tag.INDEX, child.full());
-                    } else {
-                        children[i] = child;
-                    }
-                }
-                var separators = new Slot[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
-                    var slotBytes = new byte[Slot.length];
-                    buffer.get(slotBytes);
-                    var sep = Slot.fromBytes(slotBytes);
-                    separators[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, sep);
-                }
-                var counts = new long[BTREE_SLOT_COUNT];
-                for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
+        private void populateIndex(long sourceOffset, long targetOffset) throws Exception {
+            // read 144-byte block (16 slots)
+            sourceCore.seek(sourceOffset);
+            var sourceReader = sourceCore.reader();
+            var blockBytes = new byte[INDEX_BLOCK_SIZE];
+            sourceReader.readFully(blockBytes);
 
-                targetCore.seek(newOffset);
-                var targetWriter = targetCore.writer();
-                targetWriter.writeByte(kindInt);
-                targetWriter.writeByte(num);
-                for (var s : children) targetWriter.write(s.toBytes());
-                for (var s : separators) targetWriter.write(s.toBytes());
-                for (var c : counts) targetWriter.writeLong(c);
+            // remap each slot
+            var buffer = ByteBuffer.wrap(blockBytes);
+            var remappedSlots = new Slot[SLOT_COUNT];
+            for (int i = 0; i < SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var childSlot = Slot.fromBytes(slotBytes);
+                remappedSlots[i] = remapSlot(childSlot);
+            }
 
-                return newOffset;
+            // write remapped block to target
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            for (var s : remappedSlots) {
+                targetWriter.write(s.toBytes());
             }
         }
-        throw new UnreachableException();
-    }
 
-    private static long remapHashMapOrSet(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot, boolean counted) throws Exception {
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
+        private void populateArrayList(long sourceOffset, long targetOffset) throws Exception {
+            // read ArrayListHeader (16 bytes)
+            sourceCore.seek(sourceOffset);
+            var sourceReader = sourceCore.reader();
+            var headerBytes = new byte[ArrayListHeader.length];
+            sourceReader.readFully(headerBytes);
+            var header = ArrayListHeader.fromBytes(headerBytes);
 
-        long countValue = -1;
-        if (counted) {
-            countValue = sourceReader.readLong();
+            // remap root index block pointer via remapSlot as an .index slot
+            var indexSlot = new Slot(header.ptr(), Tag.INDEX);
+            var remappedIndex = remapSlot(indexSlot);
+
+            // write new ArrayListHeader with remapped ptr
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.write(new ArrayListHeader(remappedIndex.value(), header.size()).toBytes());
         }
 
-        // read 144-byte root index block
-        var blockBytes = new byte[INDEX_BLOCK_SIZE];
-        sourceReader.readFully(blockBytes);
+        private void populateBTree(long sourceOffset, long targetOffset) throws Exception {
+            sourceCore.seek(sourceOffset);
+            var sourceReader = sourceCore.reader();
+            var headerBytes = new byte[BTreeHeader.length];
+            sourceReader.readFully(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
 
-        var newOffset = reserveBlock(targetCore, INDEX_BLOCK_SIZE + (counted ? 8 : 0));
-        offsetMap.put(slot.value(), newOffset);
+            var remappedRoot = remapBTreeNode(header.rootPtr());
 
-        // remap each child slot in the block
-        var buffer = ByteBuffer.wrap(blockBytes);
-        var remappedSlots = new Slot[SLOT_COUNT];
-        for (int i = 0; i < SLOT_COUNT; i++) {
-            var slotBytes = new byte[Slot.length];
-            buffer.get(slotBytes);
-            var childSlot = Slot.fromBytes(slotBytes);
-            remappedSlots[i] = remapSlot(sourceCore, targetCore, hashSize, offsetMap, childSlot);
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
         }
 
-        // write [optional count][remapped block] contiguously to target
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        if (counted) {
-            targetWriter.writeLong(countValue);
+        private long remapBTreeNode(long nodeOffset) throws Exception {
+            // dedup check (subtrees are shared by pointer)
+            var mapped = offsetMap.get(nodeOffset);
+            if (mapped != null) return mapped;
+
+            // read the header first because the node kind determines its size
+            sourceCore.seek(nodeOffset);
+            var sourceReader = sourceCore.reader();
+            var nodeHeader = new byte[BTREE_NODE_HEADER_SIZE];
+            sourceReader.readFully(nodeHeader);
+            var kindInt = nodeHeader[0] & 0xFF;
+            if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+            var kind = BTreeNodeKind.values()[kindInt];
+            var num = nodeHeader[1] & 0xFF;
+            if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
+
+            return switch (kind) {
+                case LEAF -> visitObject(nodeOffset, BTREE_LEAF_BLOCK_SIZE,
+                    (sourceOffset, targetOffset) -> populateBTreeLeaf(sourceOffset, targetOffset, kindInt, num));
+                case BRANCH -> visitObject(nodeOffset, BTREE_BRANCH_BLOCK_SIZE,
+                    (sourceOffset, targetOffset) -> populateBTreeBranch(sourceOffset, targetOffset, kindInt, num));
+            };
         }
-        for (var s : remappedSlots) {
-            targetWriter.write(s.toBytes());
+
+        private void populateBTreeLeaf(long sourceOffset, long targetOffset, int kind, int num) throws Exception {
+            sourceCore.seek(sourceOffset + BTREE_NODE_HEADER_SIZE);
+            var sourceReader = sourceCore.reader();
+            var body = new byte[Slot.length * BTREE_SLOT_COUNT];
+            sourceReader.readFully(body);
+            var buffer = ByteBuffer.wrap(body);
+
+            var slots = new Slot[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var valueSlot = Slot.fromBytes(slotBytes);
+                slots[i] = remapSlot(valueSlot);
+            }
+
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.writeByte(kind);
+            targetWriter.writeByte(num);
+            for (var slot : slots) targetWriter.write(slot.toBytes());
         }
 
-        return newOffset;
-    }
+        private void populateBTreeBranch(long sourceOffset, long targetOffset, int kind, int num) throws Exception {
+            sourceCore.seek(sourceOffset + BTREE_NODE_HEADER_SIZE);
+            var sourceReader = sourceCore.reader();
+            var body = new byte[(Slot.length + 8) * BTREE_SLOT_COUNT];
+            sourceReader.readFully(body);
+            var buffer = ByteBuffer.wrap(body);
 
-    private static long remapKvPair(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap, Slot slot) throws Exception {
-        // read KeyValuePair
-        sourceCore.seek(slot.value());
-        var sourceReader = sourceCore.reader();
-        var kvPairBytes = new byte[KeyValuePair.length(hashSize)];
-        sourceReader.readFully(kvPairBytes);
-        var kvPair = KeyValuePair.fromBytes(kvPairBytes, hashSize);
+            var children = new Slot[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var child = Slot.fromBytes(slotBytes);
+                if (child.tag() == Tag.INDEX) {
+                    var remappedPtr = remapBTreeNode(child.value());
+                    children[i] = new Slot(remappedPtr, Tag.INDEX, child.full());
+                } else {
+                    children[i] = child;
+                }
+            }
+            var counts = new long[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
 
-        var newOffset = reserveBlock(targetCore, KeyValuePair.length(hashSize));
-        offsetMap.put(slot.value(), newOffset);
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.writeByte(kind);
+            targetWriter.writeByte(num);
+            for (var child : children) targetWriter.write(child.toBytes());
+            for (var count : counts) targetWriter.writeLong(count);
+        }
 
-        // remap key_slot and value_slot
-        var remappedKey = remapSlot(sourceCore, targetCore, hashSize, offsetMap, kvPair.keySlot());
-        var remappedValue = remapSlot(sourceCore, targetCore, hashSize, offsetMap, kvPair.valueSlot());
+        private void populateSortedMap(long sourceOffset, long targetOffset) throws Exception {
+            sourceCore.seek(sourceOffset);
+            var sourceReader = sourceCore.reader();
+            var headerBytes = new byte[BTreeHeader.length];
+            sourceReader.readFully(headerBytes);
+            var header = BTreeHeader.fromBytes(headerBytes);
 
-        // write remapped KV pair (hash stays unchanged)
-        targetCore.seek(newOffset);
-        var targetWriter = targetCore.writer();
-        targetWriter.write(new KeyValuePair(remappedValue, remappedKey, kvPair.hash()).toBytes());
+            var remappedRoot = remapSortedMapNode(header.rootPtr());
 
-        return newOffset;
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.write(new BTreeHeader(remappedRoot, header.size()).toBytes());
+        }
+
+        private long remapSortedMapNode(long nodeOffset) throws Exception {
+            var mapped = offsetMap.get(nodeOffset);
+            if (mapped != null) return mapped;
+
+            sourceCore.seek(nodeOffset);
+            var sourceReader = sourceCore.reader();
+            var nodeHeader = new byte[BTREE_NODE_HEADER_SIZE];
+            sourceReader.readFully(nodeHeader);
+            var kindInt = nodeHeader[0] & 0xFF;
+            if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+            var kind = BTreeNodeKind.values()[kindInt];
+            var num = nodeHeader[1] & 0xFF;
+            if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
+
+            return switch (kind) {
+                case LEAF -> visitObject(nodeOffset, SORTED_LEAF_BLOCK_SIZE,
+                    (sourceOffset, targetOffset) -> populateSortedMapLeaf(sourceOffset, targetOffset, kindInt, num));
+                case BRANCH -> visitObject(nodeOffset, SORTED_BRANCH_BLOCK_SIZE,
+                    (sourceOffset, targetOffset) -> populateSortedMapBranch(sourceOffset, targetOffset, kindInt, num));
+            };
+        }
+
+        private void populateSortedMapLeaf(long sourceOffset, long targetOffset, int kind, int num) throws Exception {
+            sourceCore.seek(sourceOffset + BTREE_NODE_HEADER_SIZE);
+            var sourceReader = sourceCore.reader();
+            var body = new byte[Slot.length * BTREE_SLOT_COUNT];
+            sourceReader.readFully(body);
+            var buffer = ByteBuffer.wrap(body);
+
+            var entries = new Slot[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var entry = Slot.fromBytes(slotBytes);
+                entries[i] = remapSlot(entry);
+            }
+
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.writeByte(kind);
+            targetWriter.writeByte(num);
+            for (var entry : entries) targetWriter.write(entry.toBytes());
+        }
+
+        private void populateSortedMapBranch(long sourceOffset, long targetOffset, int kind, int num) throws Exception {
+            sourceCore.seek(sourceOffset + BTREE_NODE_HEADER_SIZE);
+            var sourceReader = sourceCore.reader();
+            var body = new byte[(Slot.length * 2 + 8) * BTREE_SLOT_COUNT];
+            sourceReader.readFully(body);
+            var buffer = ByteBuffer.wrap(body);
+
+            var children = new Slot[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var child = Slot.fromBytes(slotBytes);
+                if (child.tag() == Tag.INDEX) {
+                    var remappedPtr = remapSortedMapNode(child.value());
+                    children[i] = new Slot(remappedPtr, Tag.INDEX, child.full());
+                } else {
+                    children[i] = child;
+                }
+            }
+            var separators = new Slot[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var separator = Slot.fromBytes(slotBytes);
+                separators[i] = remapSlot(separator);
+            }
+            var counts = new long[BTREE_SLOT_COUNT];
+            for (int i = 0; i < BTREE_SLOT_COUNT; i++) counts[i] = buffer.getLong();
+
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.writeByte(kind);
+            targetWriter.writeByte(num);
+            for (var child : children) targetWriter.write(child.toBytes());
+            for (var separator : separators) targetWriter.write(separator.toBytes());
+            for (var count : counts) targetWriter.writeLong(count);
+        }
+
+        private void populateHashMapOrSet(long sourceOffset, long targetOffset) throws Exception {
+            populateHashMapOrSet(sourceOffset, targetOffset, false);
+        }
+
+        private void populateCountedHashMapOrSet(long sourceOffset, long targetOffset) throws Exception {
+            populateHashMapOrSet(sourceOffset, targetOffset, true);
+        }
+
+        private void populateHashMapOrSet(long sourceOffset, long targetOffset, boolean counted) throws Exception {
+            sourceCore.seek(sourceOffset);
+            var sourceReader = sourceCore.reader();
+
+            long countValue = -1;
+            if (counted) {
+                countValue = sourceReader.readLong();
+            }
+
+            // read 144-byte root index block
+            var blockBytes = new byte[INDEX_BLOCK_SIZE];
+            sourceReader.readFully(blockBytes);
+
+            // remap each child slot in the block
+            var buffer = ByteBuffer.wrap(blockBytes);
+            var remappedSlots = new Slot[SLOT_COUNT];
+            for (int i = 0; i < SLOT_COUNT; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var childSlot = Slot.fromBytes(slotBytes);
+                remappedSlots[i] = remapSlot(childSlot);
+            }
+
+            // write [optional count][remapped block] contiguously to target
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            if (counted) {
+                targetWriter.writeLong(countValue);
+            }
+            for (var s : remappedSlots) {
+                targetWriter.write(s.toBytes());
+            }
+        }
+
+        private void populateKvPair(long sourceOffset, long targetOffset) throws Exception {
+            // read KeyValuePair
+            sourceCore.seek(sourceOffset);
+            var sourceReader = sourceCore.reader();
+            var kvPairBytes = new byte[KeyValuePair.length(hashSize)];
+            sourceReader.readFully(kvPairBytes);
+            var kvPair = KeyValuePair.fromBytes(kvPairBytes, hashSize);
+
+            // remap key_slot and value_slot
+            var remappedKey = remapSlot(kvPair.keySlot());
+            var remappedValue = remapSlot(kvPair.valueSlot());
+
+            // write remapped KV pair (hash stays unchanged)
+            targetCore.seek(targetOffset);
+            var targetWriter = targetCore.writer();
+            targetWriter.write(new KeyValuePair(remappedValue, remappedKey, kvPair.hash()).toBytes());
+        }
     }
 }
