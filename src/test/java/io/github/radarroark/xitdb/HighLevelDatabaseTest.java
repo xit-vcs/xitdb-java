@@ -733,16 +733,14 @@ class HighLevelDatabaseTest {
             assertEquals("Pay the bills", new String(todoValue));
         }
 
-        // the db size remains the same after writing junk data
-        // and then reinitializing the db. this is useful because
-        // there could be data from a transaction that never
-        // completed due to an unclean shutdown.
+        // opening the db leaves trailing data alone, because it may
+        // belong to another writer's unfinished transaction.
         {
             core.seek(core.length());
-            var sizeBefore = core.length();
-
             var writer = core.writer();
-            writer.write("this is junk data that will be deleted during init".getBytes());
+            writer.write("this is trailing data from an unfinished transaction".getBytes());
+            core.flush();
+            var sizeWithTail = core.length();
 
             // no error is thrown if db file is opened in read-only mode
             if (fileMaybe != null) {
@@ -755,7 +753,7 @@ class HighLevelDatabaseTest {
 
             var sizeAfter = core.length();
 
-            assertEquals(sizeBefore, sizeAfter);
+            assertEquals(sizeWithTail, sizeAfter);
         }
 
         // cloning

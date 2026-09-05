@@ -62,7 +62,7 @@ public class Database {
             if (this.header.hashSize() != hasher.md().getDigestLength()) {
                 throw new InvalidHashSizeException();
             }
-            truncate();
+            validateCommittedSize();
         }
 
         this.txStart = null;
@@ -154,8 +154,8 @@ public class Database {
 
     // private
 
-    void truncate() throws IOException {
-        if (this.header.tag() != Tag.ARRAY_LIST) return;
+    private long validateCommittedSize() throws IOException {
+        if (this.header.tag() != Tag.ARRAY_LIST) return this.core.length();
 
         this.core.seek(DATABASE_START);
         var reader = this.core.reader();
@@ -172,12 +172,14 @@ public class Database {
         var fileSize = this.core.length();
 
         if (fileSize < committedSize) throw new TruncatedDatabaseException();
-        if (fileSize == committedSize) return;
+        return committedSize;
+    }
 
-        // ignore error because the file may be open in read-only mode
-        try {
+    void truncate() throws IOException {
+        var committedSize = validateCommittedSize();
+        if (this.core.length() > committedSize) {
             this.core.setLength(committedSize);
-        } catch (IOException e) {}
+        }
     }
 
     private byte[] checkHash(byte[] hash) {
