@@ -8,7 +8,19 @@ public class WriteCursor extends ReadCursor {
     }
 
     public WriteCursor writePath(Database.PathPart[] path) throws Exception {
-        var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
+        SlotPointer slotPtr;
+        try {
+            slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
+        } catch (Exception e) {
+            // only truncate when the error escapes the outer write.
+            // a nested callback's caller may still commit its work.
+            if (this.db.txStart == null) {
+                try {
+                    this.db.truncate();
+                } catch (Exception e2) {}
+            }
+            throw e;
+        }
         if (this.db.txStart == null) {
             this.db.core.sync();
         }

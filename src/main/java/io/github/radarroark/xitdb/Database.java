@@ -154,7 +154,7 @@ public class Database {
 
     // private
 
-    private void truncate() throws IOException {
+    void truncate() throws IOException {
         if (this.header.tag() != Tag.ARRAY_LIST) return;
 
         this.core.seek(DATABASE_START);
@@ -1315,16 +1315,7 @@ public class Database {
             if (pathI != path.length - 1) throw new PathPartMustBeAtEndException();
 
             var nextCursor = new WriteCursor(slotPtr, db);
-            try {
-                this.function().run(nextCursor);
-            } catch (Exception e) {
-                // since an error occured, there may be inaccessible
-                // junk at the end of the db, so delete it if possible
-                try {
-                    db.truncate();
-                } catch (Exception e2) {}
-                throw e;
-            }
+            this.function().run(nextCursor);
             return nextCursor.slotPtr;
         }
     }
