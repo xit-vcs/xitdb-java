@@ -644,7 +644,7 @@ public class Database {
             var origHeader = ArrayListHeader.fromBytes(headerBytes);
 
             // slice
-            var sliceHeader = db.readArrayListSlice(origHeader, this.size());
+            var sliceHeader = db.readArrayListSlice(origHeader, this.size(), isTopLevel);
             var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
             // if top level, updating the header below commits the transaction,
@@ -2205,7 +2205,7 @@ public class Database {
         }
     }
 
-    private ArrayListHeader readArrayListSlice(ArrayListHeader header, long size) throws IOException {
+    private ArrayListHeader readArrayListSlice(ArrayListHeader header, long size, boolean isTopLevel) throws IOException {
         var reader = this.core.reader();
 
         if (size > header.size() || size < 0) {
@@ -2229,6 +2229,17 @@ public class Database {
                 var slot = Slot.fromBytes(slotBytes);
                 shift -= 1;
                 indexPos = slot.value();
+            }
+            // the new root may still belong to a past moment. unlike child
+            // nodes, root nodes are written directly, so copy it now.
+            if (!isTopLevel && this.txStart != null && indexPos < this.txStart) {
+                var indexBlock = new byte[INDEX_BLOCK_SIZE];
+                this.core.seek(indexPos);
+                reader.readFully(indexBlock);
+                indexPos = this.core.length();
+                var writer = this.core.writer();
+                this.core.seek(indexPos);
+                writer.write(indexBlock);
             }
             return new ArrayListHeader(indexPos, size);
         }
@@ -2798,6 +2809,45 @@ public class Database {
             }
         }
 
+        private long remapArrayListIndex(long sourceOffset, long size, int shift) throws Exception {
+            var childSize = 1L << (shift * BIT_COUNT);
+
+            // full blocks can use the normal cache. partial blocks may
+            // be shared by lists with different sizes, so copy them
+            // separately and leave the slots beyond the size empty.
+            if (childSize <= Long.MAX_VALUE / SLOT_COUNT && size == childSize * SLOT_COUNT) {
+                return remapSlot(new Slot(sourceOffset, Tag.INDEX)).value();
+            }
+
+            var targetOffset = reserveBlock(INDEX_BLOCK_SIZE);
+            sourceCore.seek(sourceOffset);
+            var blockBytes = new byte[INDEX_BLOCK_SIZE];
+            sourceCore.reader().readFully(blockBytes);
+            var buffer = ByteBuffer.wrap(blockBytes);
+            var remappedBlock = ByteBuffer.allocate(INDEX_BLOCK_SIZE);
+            var remaining = size;
+            for (int i = 0; i < SLOT_COUNT && remaining > 0; i++) {
+                var slotBytes = new byte[Slot.length];
+                buffer.get(slotBytes);
+                var childSlot = Slot.fromBytes(slotBytes);
+                var count = Math.min(remaining, childSize);
+                Slot remappedSlot;
+                if (shift == 0) {
+                    remappedSlot = remapSlot(childSlot);
+                } else {
+                    if (childSlot.tag() != Tag.INDEX) throw new UnexpectedTagException();
+                    var childOffset = remapArrayListIndex(childSlot.value(), count, shift - 1);
+                    remappedSlot = new Slot(childOffset, childSlot.tag(), childSlot.full());
+                }
+                remappedBlock.put(remappedSlot.toBytes());
+                remaining -= count;
+            }
+
+            targetCore.seek(targetOffset);
+            targetCore.writer().write(remappedBlock.array());
+            return targetOffset;
+        }
+
         private void populateArrayList(long sourceOffset, long targetOffset) throws Exception {
             // read ArrayListHeader (16 bytes)
             sourceCore.seek(sourceOffset);
@@ -2806,14 +2856,13 @@ public class Database {
             sourceReader.readFully(headerBytes);
             var header = ArrayListHeader.fromBytes(headerBytes);
 
-            // remap root index block pointer via remapSlot as an .index slot
-            var indexSlot = new Slot(header.ptr(), Tag.INDEX);
-            var remappedIndex = remapSlot(indexSlot);
+            var shift = header.size() <= SLOT_COUNT ? 0 : (63 - Long.numberOfLeadingZeros(header.size() - 1)) / BIT_COUNT;
+            var remappedIndex = remapArrayListIndex(header.ptr(), header.size(), shift);
 
             // write new ArrayListHeader with remapped ptr
             targetCore.seek(targetOffset);
             var targetWriter = targetCore.writer();
-            targetWriter.write(new ArrayListHeader(remappedIndex.value(), header.size()).toBytes());
+            targetWriter.write(new ArrayListHeader(remappedIndex, header.size()).toBytes());
         }
 
         private void populateBTree(long sourceOffset, long targetOffset) throws Exception {
