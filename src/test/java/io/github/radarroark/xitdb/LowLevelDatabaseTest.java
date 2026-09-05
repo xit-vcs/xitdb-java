@@ -1530,7 +1530,7 @@ class LowLevelDatabaseTest {
                     var kvPairCursor = iter.next();
                     var kvPair = kvPairCursor.readKeyValuePair();
                     if (Arrays.equals(kvPair.hash, fooKey)) {
-                        kvPair.keyCursor.write(new Database.Bytes("bar"));
+                        assertEquals(42, kvPair.valueCursor.readUint());
                     }
                     i += 1;
                 }

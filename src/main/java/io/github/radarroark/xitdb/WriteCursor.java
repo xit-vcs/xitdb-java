@@ -133,6 +133,8 @@ public class WriteCursor extends ReadCursor {
         }
     }
 
+    // iterators don't copy shared nodes, so their cursors must
+    // be read-only. this also prevents changes to sorted keys.
     public static class Iterator extends ReadCursor.Iterator {
         public Iterator(WriteCursor cursor) throws IOException {
             super(cursor);
@@ -142,8 +144,8 @@ public class WriteCursor extends ReadCursor {
             super(cursor, size, index, stack);
         }
 
-        // wrap an already-seeked read iterator so it yields write cursors. backs
-        // the write-side iteratorFrom/iteratorFromIndex methods.
+        // wrap an already-seeked read iterator for the write-side
+        // iteratorFrom/iteratorFromIndex methods.
         static Iterator from(ReadCursor.Iterator inner) {
             return new Iterator(inner.cursor, inner.size, inner.index, inner.stack);
         }
@@ -151,16 +153,6 @@ public class WriteCursor extends ReadCursor {
         @Override
         public boolean hasNext() {
             return super.hasNext();
-        }
-
-        @Override
-        public WriteCursor next() {
-            var readCursor = super.next();
-            if (readCursor != null) {
-                return new WriteCursor(readCursor.slotPtr, readCursor.db);
-            } else {
-                return null;
-            }
         }
 
     }
