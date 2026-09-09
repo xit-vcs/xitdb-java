@@ -12,7 +12,7 @@ import java.util.HashMap;
 public class Database {
     public Core core;
     public MessageDigest md;
-    public Header header;
+    public volatile Header header;
     public Long txStart;
 
     public static final short VERSION = 0;
@@ -69,13 +69,19 @@ public class Database {
     }
 
     public WriteCursor rootCursor() throws IOException {
-        // if the header tag is none, try re-reading it.
-        // this may be necessary if the database was initialized on a different thread.
-        if (this.header.tag() == Tag.NONE) {
-            core.seek(0);
-            this.header = Header.read(core);
+        // refresh until another database initializes the root
+        var header = this.header;
+        if (header.tag() == Tag.NONE) {
+            synchronized (this) {
+                header = this.header;
+                if (header.tag() == Tag.NONE) {
+                    core.seek(0);
+                    header = Header.read(core);
+                    this.header = header;
+                }
+            }
         }
-        return new WriteCursor(new SlotPointer(null, new Slot(DATABASE_START, this.header.tag)), this);
+        return new WriteCursor(new SlotPointer(null, new Slot(DATABASE_START, header.tag)), this);
     }
 
     public void freeze() throws IOException {
