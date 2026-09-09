@@ -1452,7 +1452,6 @@ public class Database {
         }
 
         var reader = this.core.reader();
-        var writer = this.core.writer();
 
         var i = new BigInteger(keyHash).shiftRight(keyOffset * BIT_COUNT).and(BIG_MASK).intValueExact();
         var slotPos = indexPos + (Slot.length * i);
@@ -1468,6 +1467,7 @@ public class Database {
                 switch (writeMode) {
                     case READ_ONLY -> throw new KeyNotFoundException();
                     case READ_WRITE -> {
+                        var writer = this.core.writer();
                         // write hash and key/val slots
                         var hashPos = this.core.length();
                         this.core.seek(hashPos);
@@ -1501,6 +1501,7 @@ public class Database {
                 if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
                     if (this.txStart != null) {
                         if (nextPtr < this.txStart) {
+                            var writer = this.core.writer();
                             // read existing block
                             this.core.seek(ptr);
                             var indexBlock = new byte[INDEX_BLOCK_SIZE];
@@ -1529,6 +1530,7 @@ public class Database {
                     if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
                         if (this.txStart != null) {
                             if (ptr < this.txStart) {
+                                var writer = this.core.writer();
                                 // write hash and key/val slots
                                 var hashPos = this.core.length();
                                 this.core.seek(hashPos);
@@ -1575,6 +1577,7 @@ public class Database {
                     switch (writeMode) {
                         case READ_ONLY -> throw new KeyNotFoundException();
                         case READ_WRITE -> {
+                            var writer = this.core.writer();
                             // append new index block
                             if (keyOffset + 1 >= (this.header.hashSize() * 8) / BIT_COUNT) {
                                 throw new KeyOffsetExceededException();
