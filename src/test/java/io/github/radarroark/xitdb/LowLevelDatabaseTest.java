@@ -6,10 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.DataInput;
 import java.io.EOFException;
 import java.io.File;
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
+import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -22,6 +25,40 @@ import org.junit.jupiter.api.Test;
 
 class LowLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
+
+    @Test
+    void testReadOnlyFile() throws Exception {
+        var file = File.createTempFile("database", "");
+        Files.write(file.toPath(), new byte[]{42, 43});
+        var pool = Executors.newFixedThreadPool(2);
+        var barrier = new CyclicBarrier(2);
+        try (var core = new CoreReadOnlyFile(file)) {
+            var tasks = new ArrayList<Future<DataInput>>();
+            for (int i = 0; i < 2; i++) {
+                final int offset = i;
+                tasks.add(pool.submit(() -> {
+                    var input = core.reader();
+                    core.seek(offset);
+                    barrier.await(10, TimeUnit.SECONDS);
+                    assertEquals(42 + offset, input.readUnsignedByte());
+                    assertEquals(offset + 1, core.position());
+                    return input;
+                }));
+            }
+            var readers = new ArrayList<DataInput>();
+            for (var task : tasks) readers.add(task.get(10, TimeUnit.SECONDS));
+            assertEquals(0, core.position());
+            assertThrows(UnsupportedOperationException.class, core::writer);
+            assertThrows(UnsupportedOperationException.class, () -> core.setLength(0));
+            core.close();
+            for (var reader : readers) assertThrows(IOException.class, reader::readByte);
+            assertThrows(IllegalStateException.class, core::reader);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+            Files.deleteIfExists(file.toPath());
+        }
+    }
 
     @Test
     void testMemoryConcurrentAccess() throws Exception {
