@@ -41,6 +41,10 @@ public class WriteCursor extends ReadCursor {
 
     public WriteCursor writePath(Database.PathPart[] path) throws Exception {
         checkWritable();
+        // nested top-level writes could commit before the outer transaction ends
+        if (this.db.transaction != null && this.slotPtr.position() == null && path.length > 0) {
+            throw new IllegalStateException("Nested top-level writes are not allowed");
+        }
         var startsTransaction = this.db.transaction == null && this.slotPtr.position() == null
             && (this.db.header.tag() == Tag.ARRAY_LIST || (path.length > 0 && path[0] instanceof Database.ArrayListInit));
         if (startsTransaction) this.db.transaction = new Database.Transaction();

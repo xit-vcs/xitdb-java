@@ -80,6 +80,10 @@ class LowLevelDatabaseTest {
     void testExpiredWriters() throws Exception {
         var db = new Database(new CoreMemory(new RandomAccessMemory()), new Hasher(MessageDigest.getInstance("SHA-1")));
         var history = new WriteArrayList(db.rootCursor());
+        assertThrows(IllegalStateException.class, () -> db.rootCursor().writePath(new Database.PathPart[]{
+            new Database.Context(cursor -> history.append(new Database.Int(999)))
+        }));
+        assertEquals(0, history.count());
         var escaped = new WriteHashMap[1];
         var bytes = new WriteCursor.Writer[1];
         Runnable reject = () -> {
@@ -93,6 +97,8 @@ class LowLevelDatabaseTest {
             bytes[0] = escaped[0].putCursor("bytes").writer();
             bytes[0].write(new byte[16]);
             bytes[0].finish();
+            assertThrows(IllegalStateException.class, () -> history.append(new Database.Int(999)));
+            assertThrows(IllegalStateException.class, () -> history.slice(0));
             CompletableFuture.runAsync(reject).get(10, TimeUnit.SECONDS);
         });
         reject.run();
