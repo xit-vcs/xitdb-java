@@ -28,21 +28,21 @@ public class ReadHashSet implements Slotted, Iterable<ReadCursor> {
     // methods that take a string key and hash it for you
 
     public ReadCursor getCursor(String key) throws Exception {
-        return getCursor(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getCursor(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     public Slot getSlot(String key) throws Exception {
-        return getSlot(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getSlot(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     // methods that take a Database.Bytes key and hash it for you
 
     public ReadCursor getCursor(Database.Bytes key) throws Exception {
-        return getCursor(this.cursor.db.md.digest(key.value()));
+        return getCursor(this.cursor.db.hash(key.value()));
     }
 
     public Slot getSlot(Database.Bytes key) throws Exception {
-        return getSlot(this.cursor.db.md.digest(key.value()));
+        return getSlot(this.cursor.db.hash(key.value()));
     }
 
     // methods that take a hash directly

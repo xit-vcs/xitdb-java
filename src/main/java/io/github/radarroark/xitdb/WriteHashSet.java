@@ -19,29 +19,29 @@ public class WriteHashSet extends ReadHashSet {
 
     public void put(String key) throws Exception {
         var bytes = key.getBytes("UTF-8");
-        put(this.cursor.db.md.digest(bytes), new Database.Bytes(bytes));
+        put(this.cursor.db.hash(bytes), new Database.Bytes(bytes));
     }
 
     public WriteCursor putCursor(String key) throws Exception {
-        return putCursor(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return putCursor(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     public boolean remove(String key) throws Exception {
-        return remove(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return remove(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     // methods that take a Database.Bytes key and hash it for you
 
     public void put(Database.Bytes key) throws Exception {
-        put(this.cursor.db.md.digest(key.value()), key);
+        put(this.cursor.db.hash(key.value()), key);
     }
 
     public WriteCursor putCursor(Database.Bytes key) throws Exception {
-        return putCursor(this.cursor.db.md.digest(key.value()));
+        return putCursor(this.cursor.db.hash(key.value()));
     }
 
     public boolean remove(Database.Bytes key) throws Exception {
-        return remove(this.cursor.db.md.digest(key.value()));
+        return remove(this.cursor.db.hash(key.value()));
     }
 
     // methods that take a hash directly

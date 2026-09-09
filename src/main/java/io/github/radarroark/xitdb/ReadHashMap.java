@@ -28,45 +28,45 @@ public class ReadHashMap implements Slotted, Iterable<ReadCursor> {
     // methods that take a string key and hash it for you
 
     public ReadCursor getCursor(String key) throws Exception {
-        return getCursor(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getCursor(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     public Slot getSlot(String key) throws Exception {
-        return getSlot(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getSlot(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     public ReadCursor getKeyCursor(String key) throws Exception {
-        return getKeyCursor(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getKeyCursor(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     public Slot getKeySlot(String key) throws Exception {
-        return getKeySlot(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getKeySlot(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     public ReadCursor.KeyValuePairCursor getKeyValuePair(String key) throws Exception {
-        return getKeyValuePair(this.cursor.db.md.digest(key.getBytes("UTF-8")));
+        return getKeyValuePair(this.cursor.db.hash(key.getBytes("UTF-8")));
     }
 
     // methods that take a Database.Bytes key and hash it for you
 
     public ReadCursor getCursor(Database.Bytes key) throws Exception {
-        return getCursor(this.cursor.db.md.digest(key.value()));
+        return getCursor(this.cursor.db.hash(key.value()));
     }
 
     public Slot getSlot(Database.Bytes key) throws Exception {
-        return getSlot(this.cursor.db.md.digest(key.value()));
+        return getSlot(this.cursor.db.hash(key.value()));
     }
 
     public ReadCursor getKeyCursor(Database.Bytes key) throws Exception {
-        return getKeyCursor(this.cursor.db.md.digest(key.value()));
+        return getKeyCursor(this.cursor.db.hash(key.value()));
     }
 
     public Slot getKeySlot(Database.Bytes key) throws Exception {
-        return getKeySlot(this.cursor.db.md.digest(key.value()));
+        return getKeySlot(this.cursor.db.hash(key.value()));
     }
 
     public ReadCursor.KeyValuePairCursor getKeyValuePair(Database.Bytes key) throws Exception {
-        return getKeyValuePair(this.cursor.db.md.digest(key.value()));
+        return getKeyValuePair(this.cursor.db.hash(key.value()));
     }
 
     // methods that take a hash directly

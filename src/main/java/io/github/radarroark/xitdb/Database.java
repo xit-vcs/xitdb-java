@@ -5,13 +5,14 @@ import java.io.UnsupportedEncodingException;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 
 public class Database {
     public Core core;
-    public MessageDigest md;
+    private final MessageDigest md;
     public volatile Header header;
     public Long txStart;
 
@@ -49,23 +50,59 @@ public class Database {
 
     public Database(Core core, Hasher hasher) throws IOException {
         this.core = core;
-        this.md = hasher.md();
+        this.md = newDigest(hasher.md());
 
         core.seek(0);
         if (core.length() == 0) {
-            this.header = new Header(hasher.id(), (short)hasher.md().getDigestLength(), VERSION, Tag.NONE, MAGIC_NUMBER);
+            this.header = new Header(hasher.id(), (short)this.md.getDigestLength(), VERSION, Tag.NONE, MAGIC_NUMBER);
             this.header.write(core);
             this.core.flush();
         } else {
             this.header = Header.read(core);
             this.header.validate();
-            if (this.header.hashSize() != hasher.md().getDigestLength()) {
+            if (this.header.hashSize() != this.md.getDigestLength()) {
                 throw new InvalidHashSizeException();
             }
             validateCommittedSize();
         }
 
         this.txStart = null;
+    }
+
+    // TODO: consider a per-thread digest pool to reduce allocation
+    private static MessageDigest newDigest(MessageDigest source) {
+        try {
+            var digest = (MessageDigest)source.clone();
+            digest.reset();
+            return digest;
+        } catch (CloneNotSupportedException e) {
+            try {
+                return MessageDigest.getInstance(source.getAlgorithm(), source.getProvider());
+            } catch (NoSuchAlgorithmException | IllegalArgumentException cause) {
+                throw new IllegalStateException("Cannot create an independent digest", cause);
+            }
+        }
+    }
+
+    public byte[] hash(byte[] bytes) {
+        return newDigest(this.md).digest(bytes);
+    }
+
+    // returns an independent copy of the hash configuration
+    public Hasher hasher() {
+        return new Hasher(newDigest(this.md), this.header.hashId());
+    }
+
+    @FunctionalInterface
+    public interface HashFunction {
+        void update(MessageDigest digest) throws Exception;
+    }
+
+    // the callback's digest is private to this operation
+    public byte[] hash(HashFunction fn) throws Exception {
+        var digest = newDigest(this.md);
+        fn.update(digest);
+        return digest.digest();
     }
 
     public WriteCursor rootCursor() throws IOException {
