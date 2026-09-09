@@ -1,8 +1,10 @@
 package io.github.radarroark.xitdb;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.EOFException;
 import java.io.File;
@@ -11,11 +13,46 @@ import java.math.BigInteger;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 
 class LowLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
+
+    @Test
+    void testMemoryConcurrentAccess() throws Exception {
+        var memory = new RandomAccessMemory();
+        long committed = 0x0123456789abcdefL;
+        memory.writeLong(committed);
+        var pool = Executors.newSingleThreadExecutor();
+        var barrier = new CyclicBarrier(2);
+        try {
+            var writer = pool.submit(() -> {
+                var bytes = new byte[8192];
+                barrier.await(10, TimeUnit.SECONDS);
+                for (int i = 0; i < 1000; i++) {
+                    memory.seek(Long.BYTES);
+                    memory.write(bytes);
+                    memory.setLength(Long.BYTES);
+                }
+                return null;
+            });
+            barrier.await(10, TimeUnit.SECONDS);
+            for (int i = 0; i < 1000; i++) {
+                memory.seek(0);
+                Thread.yield();
+                assertEquals(committed, memory.readLong());
+            }
+            writer.get(10, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
 
     @Test
     void testLowLevelApi() throws Exception {

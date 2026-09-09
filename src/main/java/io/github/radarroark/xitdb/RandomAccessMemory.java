@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 public class RandomAccessMemory extends ByteArrayOutputStream implements DataOutput, DataInput {
+    // per-thread positions; synchronized access to shared bytes and size
     ThreadLocal<Integer> position;
 
     public RandomAccessMemory() {
@@ -20,7 +21,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
         };
     }
 
-    public void seek(int pos) {
+    public synchronized void seek(int pos) {
         if (pos > this.count) {
             this.position.set(this.count);
         } else {
@@ -28,7 +29,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
         }
     }
 
-    public void setLength(int len) throws IOException {
+    public synchronized void setLength(int len) throws IOException {
         if (len == 0) {
             reset();
         } else {
@@ -44,7 +45,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
     // ByteArrayOutputStream
 
     @Override
-    public void reset() {
+    public synchronized void reset() {
         super.reset();
         this.position.set(0);
     }
@@ -52,7 +53,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
     // DataOutput
 
     @Override
-    public void write(byte[] buffer) throws IOException {
+    public synchronized void write(byte[] buffer) throws IOException {
         int pos = this.position.get();
         if (pos < this.count) {
             int bytesBeforeEnd = Math.min(buffer.length, this.count - pos);
@@ -138,7 +139,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
     }
 
     @Override
-    public void readFully(byte[] b, int off, int len) throws IOException {
+    public synchronized void readFully(byte[] b, int off, int len) throws IOException {
         int pos = this.position.get();
         if (pos > this.count - len) throw new EOFException();
         System.arraycopy(this.buf, pos, b, off, len);
