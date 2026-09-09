@@ -3,28 +3,56 @@ package io.github.radarroark.xitdb;
 import java.io.IOException;
 
 public class WriteCursor extends ReadCursor {
+    private final Database.Transaction transaction;
+
     public WriteCursor(SlotPointer slotPtr, Database db) {
+        this(slotPtr, db, db.transaction);
+    }
+
+    private WriteCursor(SlotPointer slotPtr, Database db, Database.Transaction transaction) {
         super(slotPtr, db);
+        this.transaction = slotPtr.position() == null ? null : transaction;
+    }
+
+    private void checkWrite() {
+        var active = this.db.transaction;
+        if (active != null && active.thread != Thread.currentThread()) {
+            throw new IllegalStateException("Writer belongs to another thread");
+        }
+        if (this.transaction != null && this.transaction != active) {
+            throw new IllegalStateException("Writer belongs to an expired transaction");
+        }
+        if (this.slotPtr.position() != null && this.db.header.tag() == Tag.ARRAY_LIST && this.transaction == null) {
+            throw new IllegalStateException("Writer was created outside a transaction");
+        }
     }
 
     public WriteCursor writePath(Database.PathPart[] path) throws Exception {
-        SlotPointer slotPtr;
+        checkWrite();
+        var startsTransaction = this.db.transaction == null && this.slotPtr.position() == null
+            && (this.db.header.tag() == Tag.ARRAY_LIST || (path.length > 0 && path[0] instanceof Database.ArrayListInit));
+        if (startsTransaction) this.db.transaction = new Database.Transaction();
         try {
-            slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
-        } catch (Exception e) {
-            // only truncate when the error escapes the outer write.
-            // a nested callback's caller may still commit its work.
-            if (this.db.txStart == null) {
-                try {
-                    this.db.truncate();
-                } catch (Exception e2) {}
+            SlotPointer slotPtr;
+            try {
+                slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
+            } catch (Exception e) {
+                // only truncate when the error escapes the outer write.
+                // a nested callback's caller may still commit its work.
+                if (this.db.txStart == null) {
+                    try {
+                        this.db.truncate();
+                    } catch (Exception e2) {}
+                }
+                throw e;
             }
-            throw e;
+            if (this.db.txStart == null) {
+                this.db.core.sync();
+            }
+            return new WriteCursor(slotPtr, this.db);
+        } finally {
+            if (startsTransaction) this.db.transaction = null;
         }
-        if (this.db.txStart == null) {
-            this.db.core.sync();
-        }
-        return new WriteCursor(slotPtr, this.db);
     }
 
     public void write(Database.WriteableData data) throws Exception {
@@ -35,6 +63,7 @@ public class WriteCursor extends ReadCursor {
     }
 
     public void writeIfEmpty(Database.WriteableData data) throws Exception {
+        checkWrite();
         if (this.slotPtr.slot().empty()) {
             write(data);
         }
@@ -57,13 +86,14 @@ public class WriteCursor extends ReadCursor {
     public KeyValuePairCursor readKeyValuePair() throws IOException {
         var kvPairCursor = super.readKeyValuePair();
         return new KeyValuePairCursor(
-            new WriteCursor(kvPairCursor.valueCursor.slotPtr, this.db),
-            new WriteCursor(kvPairCursor.keyCursor.slotPtr, this.db),
+            new WriteCursor(kvPairCursor.valueCursor.slotPtr, this.db, this.transaction),
+            new WriteCursor(kvPairCursor.keyCursor.slotPtr, this.db, this.transaction),
             kvPairCursor.hash
         );
     }
 
     public Writer writer() throws IOException {
+        checkWrite();
         var writer = this.db.core.writer();
         var ptrPos = this.db.core.length();
         this.db.core.seek(ptrPos);
@@ -97,6 +127,7 @@ public class WriteCursor extends ReadCursor {
 
         @Override
         public void write(byte[] buffer) throws IOException {
+            this.parent.checkWrite();
             if (this.size < this.relativePosition) throw new Database.EndOfStreamException();
             var newPosition = this.relativePosition + buffer.length;
 
@@ -126,6 +157,7 @@ public class WriteCursor extends ReadCursor {
         }
 
         public void finish() throws IOException {
+            this.parent.checkWrite();
             var writer = this.parent.db.core.writer();
 
             if (this.formatTag != null) {

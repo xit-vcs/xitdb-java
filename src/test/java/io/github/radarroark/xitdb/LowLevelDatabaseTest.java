@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -25,6 +26,41 @@ import org.junit.jupiter.api.Test;
 
 class LowLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
+
+    @Test
+    void testExpiredWriters() throws Exception {
+        var db = new Database(new CoreMemory(new RandomAccessMemory()), new Hasher(MessageDigest.getInstance("SHA-1")));
+        var history = new WriteArrayList(db.rootCursor());
+        var escaped = new WriteHashMap[1];
+        var bytes = new WriteCursor.Writer[1];
+        Runnable reject = () -> {
+            assertThrows(IllegalStateException.class, () -> escaped[0].put("v", new Database.Int(999)));
+            assertThrows(IllegalStateException.class, () -> bytes[0].write(1));
+            assertThrows(IllegalStateException.class, () -> bytes[0].finish());
+        };
+        history.appendContext(null, cursor -> {
+            escaped[0] = new WriteHashMap(cursor);
+            escaped[0].put("v", new Database.Int(1));
+            bytes[0] = escaped[0].putCursor("bytes").writer();
+            bytes[0].write(new byte[16]);
+            bytes[0].finish();
+            CompletableFuture.runAsync(reject).get(10, TimeUnit.SECONDS);
+        });
+        reject.run();
+        history.appendContext(history.getSlot(0), cursor -> {
+            reject.run();
+            new WriteHashMap(cursor).put("v", new Database.Int(2));
+        });
+        assertEquals(1, new ReadHashMap(history.getCursor(0)).getCursor("v").readInt());
+        assertEquals(2, new ReadHashMap(history.getCursor(1)).getCursor("v").readInt());
+        assertThrows(IllegalArgumentException.class, () -> history.appendContext(null, cursor -> {
+            escaped[0] = new WriteHashMap(cursor);
+            throw new IllegalArgumentException();
+        }));
+        reject.run();
+        history.appendContext(history.getSlot(1), cursor -> reject.run());
+        assertEquals(2, new ReadHashMap(history.getCursor(2)).getCursor("v").readInt());
+    }
 
     @Test
     void testReadOnlyFile() throws Exception {
@@ -676,9 +712,9 @@ class LowLevelDatabaseTest {
                     new Database.ArrayListAppend(),
                     new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                     new Database.HashMapInit(),
-                    new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                    new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                    new Database.WriteData(new Database.Bytes("longstring"))
                 });
-                barCursor.write(new Database.Bytes("longstring"));
 
                 // the slot tag is BYTES because the byte array is > 8 bytes long
                 assertEquals(Tag.BYTES, barCursor.slot().tag());
@@ -690,9 +726,9 @@ class LowLevelDatabaseTest {
                         new Database.ArrayListAppend(),
                         new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                         new Database.HashMapInit(),
-                        new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                        new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                        new Database.Context(cursor -> cursor.writeIfEmpty(new Database.Bytes("longstring")))
                     });
-                    nextBarCursor.writeIfEmpty(new Database.Bytes("longstring"));
                     assertEquals(barCursor.slot().value(), nextBarCursor.slot().value());
                 }
 
@@ -703,9 +739,9 @@ class LowLevelDatabaseTest {
                         new Database.ArrayListAppend(),
                         new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                         new Database.HashMapInit(),
-                        new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                        new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                        new Database.WriteData(new Database.Bytes("longstring"))
                     });
-                    nextBarCursor.write(new Database.Bytes("longstring"));
                     assertNotEquals(barCursor.slot().value(), nextBarCursor.slot().value());
                 }
             }
@@ -727,9 +763,9 @@ class LowLevelDatabaseTest {
                     new Database.ArrayListAppend(),
                     new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                     new Database.HashMapInit(),
-                    new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                    new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                    new Database.WriteData(new Database.Bytes("shortstr"))
                 });
-                barCursor.write(new Database.Bytes("shortstr"));
 
                 // the slot tag is SHORT_BYTES because the byte array is <= 8 bytes long
                 assertEquals(Tag.SHORT_BYTES, barCursor.slot().tag());
@@ -751,9 +787,9 @@ class LowLevelDatabaseTest {
                         new Database.ArrayListAppend(),
                         new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                         new Database.HashMapInit(),
-                        new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                        new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                        new Database.WriteData(new Database.Bytes("shortstr", "st"))
                     });
-                    barCursor.write(new Database.Bytes("shortstr", "st"));
 
                     // the slot tag is BYTES because the byte array is > 8 bytes long including the format tag
                     assertEquals(Tag.BYTES, barCursor.slot().tag());
@@ -782,9 +818,9 @@ class LowLevelDatabaseTest {
                         new Database.ArrayListAppend(),
                         new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                         new Database.HashMapInit(),
-                        new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                        new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                        new Database.WriteData(new Database.Bytes("shorts", "st"))
                     });
-                    barCursor.write(new Database.Bytes("shorts", "st"));
 
                     // the slot tag is SHORT_BYTES because the byte array is <= 8 bytes long including the format tag
                     assertEquals(Tag.SHORT_BYTES, barCursor.slot().tag());
@@ -813,9 +849,9 @@ class LowLevelDatabaseTest {
                         new Database.ArrayListAppend(),
                         new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                         new Database.HashMapInit(),
-                        new Database.HashMapGet(new Database.HashMapGetValue(barKey))
+                        new Database.HashMapGet(new Database.HashMapGetValue(barKey)),
+                        new Database.WriteData(new Database.Bytes("short", "st"))
                     });
-                    barCursor.write(new Database.Bytes("short", "st"));
 
                     // the slot tag is SHORT_BYTES because the byte array is <= 8 bytes long including the format tag
                     assertEquals(Tag.SHORT_BYTES, barCursor.slot().tag());

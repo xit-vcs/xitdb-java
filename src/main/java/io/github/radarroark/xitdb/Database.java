@@ -15,6 +15,11 @@ public class Database {
     private final MessageDigest md;
     public volatile Header header;
     public Long txStart;
+    volatile Transaction transaction;
+
+    static final class Transaction {
+        final Thread thread = Thread.currentThread();
+    }
 
     public static final short VERSION = 0;
     public static final byte[] MAGIC_NUMBER = new byte[]{'x', 'i', 't'};
