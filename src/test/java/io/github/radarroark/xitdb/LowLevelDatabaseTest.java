@@ -60,11 +60,12 @@ class LowLevelDatabaseTest {
         });
         assertEquals(3, new ReadHashMap(result).getCursor("v").readInt());
         assertEquals(history.getSlot(0), result.slot());
-        history.appendContext(null, cursor -> {
+        var frozen = new ReadCursor[1];
+        assertThrows(IllegalArgumentException.class, () -> history.appendContext(null, cursor -> {
             var writer = cursor.writer();
             writer.write(new byte[16]);
             writer.finish();
-            var frozen = new ReadCursor(cursor.slotPtr, db);
+            frozen[0] = new ReadCursor(cursor.slotPtr, db);
             db.freeze();
             writer.seek(0);
             assertThrows(IllegalStateException.class, () -> writer.write(99));
@@ -72,8 +73,18 @@ class LowLevelDatabaseTest {
             var next = cursor.writer();
             next.write(new byte[16]);
             next.finish();
-            assertArrayEquals(new byte[16], frozen.readBytes(MAX_READ_BYTES));
-        });
+            assertArrayEquals(new byte[16], frozen[0].readBytes(MAX_READ_BYTES));
+            throw new IllegalArgumentException();
+        }));
+        assertArrayEquals(new byte[16], frozen[0].readBytes(MAX_READ_BYTES));
+        assertEquals(Tag.NONE, history.appendCursor().slot().tag());
+        assertEquals(null, history.getSlot(-1));
+        assertThrows(AssertionError.class, () -> history.appendContext(new Database.Bytes(new byte[16]), cursor -> {
+            throw new AssertionError();
+        }));
+        history.append(new Database.Bytes("abcdefghijklmnop"));
+        assertEquals(3, history.count());
+        assertArrayEquals(new byte[16], frozen[0].readBytes(MAX_READ_BYTES));
     }
 
     @Test

@@ -232,6 +232,15 @@ public class Database {
 
     void truncate() throws IOException {
         var committedSize = validateCommittedSize();
+        var active = this.transaction;
+        if (active != null && active.frozenAt != null && active.frozenAt > committedSize) {
+            // retain frozen bytes without publishing the failed transaction
+            this.core.sync();
+            this.core.seek(DATABASE_START + ArrayListHeader.length);
+            this.core.writer().writeLong(active.frozenAt);
+            this.core.sync();
+            committedSize = active.frozenAt;
+        }
         if (this.core.length() > committedSize) {
             this.core.setLength(committedSize);
         }
@@ -2220,6 +2229,10 @@ public class Database {
         }
 
         var slotPtr = readArrayListSlot(indexPos, key, nextShift, writeMode, isTopLevel);
+        // clear values left by a rollback or slice
+        slotPtr = slotPtr.withSlot(new Slot());
+        this.core.seek(slotPtr.position());
+        writer.write(slotPtr.slot().toBytes());
         return new ArrayListAppendResult(new ArrayListHeader(indexPos, header.size() + 1), slotPtr);
     }
 

@@ -53,7 +53,7 @@ public class WriteCursor extends ReadCursor {
             try {
                 reloadSlot();
                 slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
-            } catch (Exception e) {
+            } catch (Exception | Error e) {
                 // only truncate when the error escapes the outer write.
                 // a nested callback's caller may still commit its work.
                 if (this.db.txStart == null) {
