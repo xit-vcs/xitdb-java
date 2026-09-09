@@ -14,7 +14,8 @@ public class WriteCursor extends ReadCursor {
         this.transaction = slotPtr.position() == null ? null : transaction;
     }
 
-    private void checkWrite() {
+    // require the active transaction, its owning thread, and a writable slot
+    private void checkWritable() {
         var active = this.db.transaction;
         if (active != null && active.thread != Thread.currentThread()) {
             throw new IllegalStateException("Writer belongs to another thread");
@@ -25,16 +26,28 @@ public class WriteCursor extends ReadCursor {
         if (this.slotPtr.position() != null && this.db.header.tag() == Tag.ARRAY_LIST && this.transaction == null) {
             throw new IllegalStateException("Writer was created outside a transaction");
         }
+        this.db.checkFrozenSlot(this.slotPtr);
+    }
+
+    // reload after freezing because copy-on-write may change where the slot points
+    private void reloadSlot() throws IOException {
+        if (this.transaction != null && this.transaction.frozenAt != null && this.slotPtr.position() != null) {
+            this.db.core.seek(this.slotPtr.position());
+            var bytes = new byte[Slot.length];
+            this.db.core.reader().readFully(bytes);
+            this.slotPtr = this.slotPtr.withSlot(Slot.fromBytes(bytes));
+        }
     }
 
     public WriteCursor writePath(Database.PathPart[] path) throws Exception {
-        checkWrite();
+        checkWritable();
         var startsTransaction = this.db.transaction == null && this.slotPtr.position() == null
             && (this.db.header.tag() == Tag.ARRAY_LIST || (path.length > 0 && path[0] instanceof Database.ArrayListInit));
         if (startsTransaction) this.db.transaction = new Database.Transaction();
         try {
             SlotPointer slotPtr;
             try {
+                reloadSlot();
                 slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
             } catch (Exception e) {
                 // only truncate when the error escapes the outer write.
@@ -49,7 +62,10 @@ public class WriteCursor extends ReadCursor {
             if (this.db.txStart == null) {
                 this.db.core.sync();
             }
-            return new WriteCursor(slotPtr, this.db);
+            reloadSlot();
+            var cursor = new WriteCursor(slotPtr, this.db);
+            cursor.reloadSlot();
+            return cursor;
         } finally {
             if (startsTransaction) this.db.transaction = null;
         }
@@ -63,7 +79,7 @@ public class WriteCursor extends ReadCursor {
     }
 
     public void writeIfEmpty(Database.WriteableData data) throws Exception {
-        checkWrite();
+        checkWritable();
         if (this.slotPtr.slot().empty()) {
             write(data);
         }
@@ -93,7 +109,7 @@ public class WriteCursor extends ReadCursor {
     }
 
     public Writer writer() throws IOException {
-        checkWrite();
+        checkWritable();
         var writer = this.db.core.writer();
         var ptrPos = this.db.core.length();
         this.db.core.seek(ptrPos);
@@ -127,7 +143,7 @@ public class WriteCursor extends ReadCursor {
 
         @Override
         public void write(byte[] buffer) throws IOException {
-            this.parent.checkWrite();
+            checkWritable();
             if (this.size < this.relativePosition) throw new Database.EndOfStreamException();
             var newPosition = this.relativePosition + buffer.length;
 
@@ -157,7 +173,7 @@ public class WriteCursor extends ReadCursor {
         }
 
         public void finish() throws IOException {
-            this.parent.checkWrite();
+            checkWritable();
             var writer = this.parent.db.core.writer();
 
             if (this.formatTag != null) {
@@ -177,6 +193,15 @@ public class WriteCursor extends ReadCursor {
             writer.write(this.slot.toBytes());
 
             this.parent.slotPtr = this.parent.slotPtr.withSlot(this.slot);
+        }
+
+        // validate the parent cursor and reject writes to frozen bytes
+        private void checkWritable() {
+            this.parent.checkWritable();
+            var active = this.parent.db.transaction;
+            if (active != null && active.frozenAt != null && this.slot.value() < active.frozenAt) {
+                throw new IllegalStateException("Byte writer points into frozen data");
+            }
         }
 
         public void seek(long position) {

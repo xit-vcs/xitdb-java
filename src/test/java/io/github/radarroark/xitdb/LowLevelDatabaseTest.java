@@ -28,6 +28,55 @@ class LowLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
 
     @Test
+    void testFrozenWriters() throws Exception {
+        var db = new Database(new CoreMemory(new RandomAccessMemory()), new Hasher(MessageDigest.getInstance("SHA-1")));
+        var history = new WriteArrayList(db.rootCursor());
+        var result = db.rootCursor().writePath(new Database.PathPart[]{
+            new Database.ArrayListAppend(),
+            new Database.HashMapInit(),
+            new Database.Context(cursor -> {
+                var map = new WriteHashMap(cursor);
+                map.put("v", new Database.Int(1));
+                var child = new WriteHashMap(map.putCursor("child"));
+                child.put("v", new Database.Int(2));
+                var equivalent = ((WriteCursor)map.cursor).writePath(new Database.PathPart[]{});
+                var frozen = new ReadHashMap(new ReadCursor(map.cursor.slotPtr, db));
+                var boundary = db.txStart;
+                CompletableFuture.runAsync(() -> assertThrows(IllegalStateException.class, db::freeze))
+                    .get(10, TimeUnit.SECONDS);
+                assertEquals(boundary, db.txStart);
+                db.freeze();
+                assertThrows(IllegalStateException.class, () -> child.put("v", new Database.Int(999)));
+                equivalent.writePath(new Database.PathPart[]{
+                    new Database.HashMapGet(new Database.HashMapGetValue(db.hash("v".getBytes()))),
+                    new Database.WriteData(new Database.Int(999))
+                });
+                map.put("v", new Database.Int(3));
+                new WriteHashMap(map.putCursor("child")).put("v", new Database.Int(4));
+                assertEquals(1, frozen.getCursor("v").readInt());
+                assertEquals(2, new ReadHashMap(frozen.getCursor("child")).getCursor("v").readInt());
+                assertEquals(3, map.getCursor("v").readInt());
+            })
+        });
+        assertEquals(3, new ReadHashMap(result).getCursor("v").readInt());
+        assertEquals(history.getSlot(0), result.slot());
+        history.appendContext(null, cursor -> {
+            var writer = cursor.writer();
+            writer.write(new byte[16]);
+            writer.finish();
+            var frozen = new ReadCursor(cursor.slotPtr, db);
+            db.freeze();
+            writer.seek(0);
+            assertThrows(IllegalStateException.class, () -> writer.write(99));
+            assertThrows(IllegalStateException.class, writer::finish);
+            var next = cursor.writer();
+            next.write(new byte[16]);
+            next.finish();
+            assertArrayEquals(new byte[16], frozen.readBytes(MAX_READ_BYTES));
+        });
+    }
+
+    @Test
     void testExpiredWriters() throws Exception {
         var db = new Database(new CoreMemory(new RandomAccessMemory()), new Hasher(MessageDigest.getInstance("SHA-1")));
         var history = new WriteArrayList(db.rootCursor());

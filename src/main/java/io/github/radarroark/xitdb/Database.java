@@ -19,6 +19,8 @@ public class Database {
 
     static final class Transaction {
         final Thread thread = Thread.currentThread();
+        Long rootPosition;
+        Long frozenAt;
     }
 
     public static final short VERSION = 0;
@@ -127,11 +129,16 @@ public class Database {
     }
 
     public void freeze() throws IOException {
-        if (this.txStart != null) {
-            this.txStart = this.core.length();
-        } else {
+        var active = this.transaction;
+        if (active == null) {
             throw new ExpectedTxStartException();
         }
+        if (active.thread != Thread.currentThread()) {
+            throw new IllegalStateException("Transaction belongs to another thread");
+        }
+        if (this.txStart == null) throw new ExpectedTxStartException();
+        this.txStart = this.core.length();
+        active.frozenAt = this.txStart;
     }
 
     public Database compact(Core targetCore) throws Exception {
@@ -256,6 +263,24 @@ public class Database {
         return n;
     }
 
+    // reject writes into frozen data; the current transaction's root slot remains writable
+    void checkFrozenSlot(SlotPointer slotPtr) {
+        var active = this.transaction;
+        if (active != null && active.frozenAt != null && slotPtr.position() != null
+            && slotPtr.position() < active.frozenAt && !slotPtr.position().equals(active.rootPosition)) {
+            throw new IllegalStateException("Writer points into frozen data; reacquire it from the transaction root");
+        }
+    }
+
+    // copy frozen collection storage before mutation to preserve existing readers
+    private SlotPointer copyCollectionIfFrozen(SlotPointer slotPtr, boolean isTopLevel, PathPart init) throws Exception {
+        if (!isTopLevel && this.transaction != null
+            && this.transaction.frozenAt != null && slotPtr.slot().value() < this.transaction.frozenAt) {
+            return init.readSlotPointer(this, false, WriteMode.READ_WRITE, new PathPart[]{init}, 0, slotPtr);
+        }
+        return slotPtr;
+    }
+
     protected SlotPointer readSlotPointer(WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
         if (pathI == path.length) {
             if (writeMode == WriteMode.READ_ONLY && slotPtr.slot().tag() == Tag.NONE) {
@@ -263,6 +288,7 @@ public class Database {
             }
             return slotPtr;
         }
+        if (writeMode == WriteMode.READ_WRITE) checkFrozenSlot(slotPtr);
         var part = path[pathI];
 
         var isTopLevel = slotPtr.slot().value() == DATABASE_START;
@@ -611,6 +637,7 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new ArrayListInit());
             var nextArrayListStart = slotPtr.slot().value();
             var index = this.index();
 
@@ -640,6 +667,7 @@ public class Database {
             if (tag != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
             var reader = db.core.reader();
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new ArrayListInit());
             var nextArrayListStart = slotPtr.slot().value();
 
             // read header
@@ -650,9 +678,17 @@ public class Database {
 
             // append
             var appendResult = db.readArrayListSlotAppend(origHeader, writeMode, isTopLevel);
+            var writer = db.core.writer();
+            // update nested headers before callbacks can freeze them
+            if (!isTopLevel) {
+                db.core.seek(nextArrayListStart);
+                writer.write(appendResult.header().toBytes());
+            }
+            if (isTopLevel && db.transaction != null) {
+                db.transaction.rootPosition = appendResult.slotPtr().position();
+            }
             var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, appendResult.slotPtr());
 
-            var writer = db.core.writer();
             if (isTopLevel) {
                 // flush and fsync before updating the header, because updating
                 // the header is what completes the transaction. without the
@@ -668,10 +704,6 @@ public class Database {
                 // update header
                 db.core.seek(nextArrayListStart);
                 writer.write(header.toBytes());
-            } else {
-                // update header
-                db.core.seek(nextArrayListStart);
-                writer.write(appendResult.header().toBytes());
             }
 
             return finalSlotPtr;
@@ -685,6 +717,7 @@ public class Database {
             if (slotPtr.slot().tag() != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
             var reader = db.core.reader();
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new ArrayListInit());
             var nextArrayListStart = slotPtr.slot().value();
 
             // read header
@@ -695,18 +728,20 @@ public class Database {
 
             // slice
             var sliceHeader = db.readArrayListSlice(origHeader, this.size(), isTopLevel);
+            var writer = db.core.writer();
+            // update nested headers before callbacks can freeze them
+            if (!isTopLevel) {
+                db.core.seek(nextArrayListStart);
+                writer.write(sliceHeader.toBytes());
+            }
             var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
 
-            // if top level, updating the header below commits the transaction,
-            // so make everything written so far durable first
+            // commit the top-level header after the callback's writes are durable
             if (isTopLevel) {
                 db.core.sync();
+                db.core.seek(nextArrayListStart);
+                writer.write(sliceHeader.toBytes());
             }
-
-            // update header
-            var writer = db.core.writer();
-            db.core.seek(nextArrayListStart);
-            writer.write(sliceHeader.toBytes());
 
             return finalSlotPtr;
         }
@@ -774,6 +809,7 @@ public class Database {
 
             var index = this.index();
 
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -791,15 +827,13 @@ public class Database {
             } else {
                 // path-copy down to the value slot so the write is persistent
                 var writeSlot = db.btreeGetForWrite(header.rootPtr(), rank);
-                var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(writeSlot.valuePosition(), writeSlot.slot()));
-                // the header only needs rewriting if the root actually moved (it stays
-                // put when the whole path was already this-transaction)
+                // update the header before callbacks can freeze it
                 if (writeSlot.nodePtr() != header.rootPtr()) {
                     var writer = db.core.writer();
                     db.core.seek(headerPtr);
                     writer.write(new BTreeHeader(writeSlot.nodePtr(), header.size()).toBytes());
                 }
-                return finalSlotPtr;
+                return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(writeSlot.valuePosition(), writeSlot.slot()));
             }
         }
     }
@@ -810,6 +844,7 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -837,6 +872,7 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -872,6 +908,7 @@ public class Database {
 
             if (this.list().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -906,6 +943,7 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -938,6 +976,7 @@ public class Database {
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1090,6 +1129,7 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
             long indexPos = counted ? slotPtr.slot().value() + 8 : slotPtr.slot().value();
 
             var res = db.readMapSlot(indexPos, db.checkHash(this.target()), (byte)0, writeMode, isTopLevel, this.target());
@@ -1119,6 +1159,7 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
             long indexPos = counted ? slotPtr.slot().value() + 8 : slotPtr.slot().value();
 
             boolean keyFound = true;
@@ -1207,6 +1248,7 @@ public class Database {
             else if (this.target() instanceof SortedMapGetValue t) key = t.key();
             else throw new IllegalArgumentException();
 
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1277,6 +1319,7 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
