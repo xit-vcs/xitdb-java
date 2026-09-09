@@ -219,7 +219,7 @@ public class Database {
 
         var isTopLevel = slotPtr.slot().value() == DATABASE_START;
 
-        var isTxStart = isTopLevel && this.header.tag == Tag.ARRAY_LIST && this.txStart == null;
+        var isTxStart = writeMode == WriteMode.READ_WRITE && isTopLevel && this.header.tag == Tag.ARRAY_LIST && this.txStart == null;
         if (isTxStart) {
             this.txStart = this.core.length();
         }
