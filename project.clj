@@ -1,4 +1,4 @@
-(defproject io.github.radarroark/xitdb "0.35.0"
+(defproject io.github.radarroark/xitdb "0.36.0"
   :url "https://github.com/xit-vcs/xitdb-java"
   :description "An immutable database"
   :license {:name "MIT License"
