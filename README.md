@@ -38,6 +38,8 @@ In this example, we create a new database, write some data in a transaction, and
 
 ```java
 try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(new File("main.db"), "rw"))) {
+    core.file.getChannel().lock(); // acquire an exclusive file lock (only needed when writing)
+
     // init the db
     var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
     var db = new Database(core, hasher);
@@ -559,4 +561,4 @@ This compacted database will be in a separate file. If you want to delete the or
 
 ## Thread Safety
 
-It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. You can do this by creating a `ThreadLocal`. See [the multithreading test](https://github.com/xit-vcs/xitdb-java/blob/d7cf0869cf0f66eca823051dfbdec0ab5e5a09cb/src/test/java/io/github/radarroark/xitdb/DatabaseTest.java#L201) for an example of this. Also, keep in mind that writes still need to come from one thread at a time.
+It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. You can do this by creating a `ThreadLocal`. See [the multithreading test](https://github.com/xit-vcs/xitdb-java/blob/d7cf0869cf0f66eca823051dfbdec0ab5e5a09cb/src/test/java/io/github/radarroark/xitdb/DatabaseTest.java#L201) for an example of this. Also, keep in mind that writes still need to come from one thread at a time; see the example at the top of this file, where it acquires an exclusive file lock.
