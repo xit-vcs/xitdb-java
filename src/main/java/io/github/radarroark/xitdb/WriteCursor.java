@@ -114,6 +114,7 @@ public class WriteCursor extends ReadCursor {
 
     public Writer writer() throws IOException {
         checkWritable();
+        if (this.db.header.tag() == Tag.ARRAY_LIST && this.db.txStart == null) throw new Database.ExpectedTxStartException();
         var writer = this.db.core.writer();
         var ptrPos = this.db.core.length();
         this.db.core.seek(ptrPos);
@@ -197,11 +198,13 @@ public class WriteCursor extends ReadCursor {
             writer.write(this.slot.toBytes());
 
             this.parent.slotPtr = this.parent.slotPtr.withSlot(this.slot);
+            if (this.parent.db.txStart == null) this.parent.db.core.sync();
         }
 
         // validate the parent cursor and reject writes to frozen bytes
         private void checkWritable() {
             this.parent.checkWritable();
+            if (this.parent.db.header.tag() == Tag.ARRAY_LIST && this.parent.db.txStart == null) throw new Database.ExpectedTxStartException();
             var active = this.parent.db.transaction;
             if (active != null && active.frozenAt != null && this.slot.value() < active.frozenAt) {
                 throw new IllegalStateException("Byte writer points into frozen data");

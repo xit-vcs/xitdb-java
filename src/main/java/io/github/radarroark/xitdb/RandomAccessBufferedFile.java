@@ -42,7 +42,11 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
     }
 
     public long length() throws IOException {
-        return Math.max(this.memoryPos + this.memory.size(), this.file.length());
+        var bufferSize = this.memory.size();
+        // a failed allocation after seeking past eof can leave an empty
+        // buffer beyond the file's end, even after rollback.
+        if (bufferSize == 0) return this.file.length();
+        return Math.max(this.memoryPos + bufferSize, this.file.length());
     }
 
     public long position() throws IOException {

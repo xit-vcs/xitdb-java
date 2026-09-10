@@ -91,7 +91,7 @@ class LowLevelDatabaseTest {
     void testExpiredWriters() throws Exception {
         var db = new Database(new CoreMemory(new RandomAccessMemory()), new Hasher(MessageDigest.getInstance("SHA-1")));
         var history = new WriteArrayList(db.rootCursor());
-        assertThrows(IllegalStateException.class, () -> db.rootCursor().writePath(new Database.PathPart[]{
+        assertThrows(Database.CursorNotWriteableException.class, () -> db.rootCursor().writePath(new Database.PathPart[]{
             new Database.Context(cursor -> history.append(new Database.Int(999)))
         }));
         assertEquals(0, history.count());
@@ -1469,7 +1469,8 @@ class LowLevelDatabaseTest {
             // so we have the old root again
             rootCursor.writePath(new Database.PathPart[]{
                 new Database.ArrayListInit(),
-                new Database.ArrayListGet(-1),
+                new Database.ArrayListAppend(),
+                new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                 new Database.ArrayListInit(),
                 new Database.ArrayListSlice(Database.SLOT_COUNT)
             });
@@ -1591,7 +1592,8 @@ class LowLevelDatabaseTest {
             {
                 rootCursor.writePath(new Database.PathPart[]{
                     new Database.ArrayListInit(),
-                    new Database.ArrayListGet(-1),
+                    new Database.ArrayListAppend(),
+                    new Database.WriteData(rootCursor.readPathSlot(new Database.PathPart[]{new Database.ArrayListGet(-1)})),
                     new Database.ArrayListInit(),
                     new Database.ArrayListGet(0),
                     new Database.WriteData(null)

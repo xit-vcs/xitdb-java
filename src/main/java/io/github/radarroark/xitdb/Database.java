@@ -193,16 +193,9 @@ public class Database {
         target.core.seek(0);
         target.header.write(target.core);
 
-        // flush, update file_size, flush again
-        target.core.flush();
-        var fileSize = target.core.length();
-        target.core.seek(DATABASE_START + ArrayListHeader.length);
-        targetWriter.writeLong(fileSize);
-        target.core.flush();
-
         // fsync so the compacted database is durable, since callers
         // typically rename it over an existing database file
-        target.core.sync();
+        target.updateCommittedSize();
 
         return target;
     }
@@ -243,6 +236,19 @@ public class Database {
         }
         if (this.core.length() > committedSize) {
             this.core.setLength(committedSize);
+        }
+    }
+
+    private void updateCommittedSize() throws IOException {
+        this.core.sync();
+        if (this.header.tag() == Tag.ARRAY_LIST) {
+            this.core.seek(DATABASE_START + ArrayListHeader.length);
+            var committedSize = this.core.reader().readLong();
+            var fileSize = this.core.length();
+            if (fileSize == committedSize) return;
+            this.core.seek(DATABASE_START + ArrayListHeader.length);
+            this.core.writer().writeLong(fileSize);
+            this.core.sync();
         }
     }
 
@@ -300,10 +306,12 @@ public class Database {
         if (writeMode == WriteMode.READ_WRITE) checkFrozenSlot(slotPtr);
         var part = path[pathI];
 
-        var isTopLevel = slotPtr.slot().value() == DATABASE_START;
+        var isTopLevel = slotPtr.position() == null && slotPtr.slot().value() == DATABASE_START;
 
         var isTxStart = writeMode == WriteMode.READ_WRITE && isTopLevel && this.header.tag == Tag.ARRAY_LIST && this.txStart == null;
         if (isTxStart) {
+            // discard data left by an unfinished transaction after a crash.
+            this.truncate();
             this.txStart = this.core.length();
         }
 
@@ -639,6 +647,8 @@ public class Database {
 
     public static record ArrayListGet(long index) implements PathPart {
         public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+            if (writeMode == WriteMode.READ_WRITE && isTopLevel && db.header.tag() == Tag.ARRAY_LIST) throw new WriteNotAllowedException();
+
             var tag = isTopLevel ? db.header.tag : slotPtr.slot().tag();
             switch (tag) {
                 case NONE -> throw new KeyNotFoundException();
@@ -1413,6 +1423,7 @@ public class Database {
     public static record Context(ContextFunction function) implements PathPart {
         public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
+            if (isTopLevel && db.header.tag() == Tag.ARRAY_LIST) throw new CursorNotWriteableException();
 
             if (pathI != path.length - 1) throw new PathPartMustBeAtEndException();
 
@@ -2266,9 +2277,7 @@ public class Database {
                         // if top level array list, update the file size in the list
                         // header to prevent truncation from destroying this block
                         if (isTopLevel) {
-                            var fileSize = this.core.length();
-                            this.core.seek(DATABASE_START + ArrayListHeader.length);
-                            writer.writeLong(fileSize);
+                            this.updateCommittedSize();
                         }
                         this.core.seek(slotPos);
                         writer.write(new Slot(nextIndexPos, Tag.INDEX).toBytes());

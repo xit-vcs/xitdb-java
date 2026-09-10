@@ -734,9 +734,11 @@ class HighLevelDatabaseTest {
         }
 
         // opening the db leaves trailing data alone, because it may
-        // belong to another writer's unfinished transaction.
+        // belong to another writer's unfinished transaction. the next
+        // write transaction truncates it before allocating new data.
         {
-            core.seek(core.length());
+            var sizeBefore = core.length();
+            core.seek(sizeBefore);
             var writer = core.writer();
             writer.write("this is trailing data from an unfinished transaction".getBytes());
             core.flush();
@@ -754,6 +756,8 @@ class HighLevelDatabaseTest {
             var sizeAfter = core.length();
 
             assertEquals(sizeWithTail, sizeAfter);
+            new WriteArrayList(db.rootCursor());
+            assertEquals(sizeBefore, core.length());
         }
 
         // cloning
