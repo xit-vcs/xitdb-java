@@ -46,6 +46,7 @@ class LowLevelDatabaseTest {
                     .get(10, TimeUnit.SECONDS);
                 assertEquals(boundary, db.txStart);
                 db.freeze();
+                assertEquals(new ReadHashMap(frozen.getCursor("child")).slot(), child.slot());
                 assertThrows(IllegalStateException.class, () -> child.put("v", new Database.Int(999)));
                 equivalent.writePath(new Database.PathPart[]{
                     new Database.HashMapGet(new Database.HashMapGetValue(db.hash("v".getBytes()))),
@@ -113,6 +114,7 @@ class LowLevelDatabaseTest {
             CompletableFuture.runAsync(reject).get(10, TimeUnit.SECONDS);
         });
         reject.run();
+        assertEquals(history.getSlot(0), escaped[0].slot());
         history.appendContext(history.getSlot(0), cursor -> {
             reject.run();
             new WriteHashMap(cursor).put("v", new Database.Int(2));
@@ -124,6 +126,9 @@ class LowLevelDatabaseTest {
             throw new IllegalArgumentException();
         }));
         reject.run();
+        assertThrows(IllegalStateException.class, () -> escaped[0].slot());
+        assertThrows(IllegalStateException.class, () -> history.appendContext(null, cursor -> cursor.write(escaped[0].slot())));
+        assertEquals(2, history.count());
         history.appendContext(history.getSlot(1), cursor -> reject.run());
         assertEquals(2, new ReadHashMap(history.getCursor(2)).getCursor("v").readInt());
     }

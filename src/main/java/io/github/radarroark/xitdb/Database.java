@@ -19,6 +19,7 @@ public class Database {
 
     static final class Transaction {
         final Thread thread = Thread.currentThread();
+        volatile boolean aborted;
         Long rootPosition;
         Long frozenAt;
     }

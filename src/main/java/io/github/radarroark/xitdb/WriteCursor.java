@@ -29,6 +29,15 @@ public class WriteCursor extends ReadCursor {
         this.db.checkFrozenSlot(this.slotPtr);
     }
 
+    @Override
+    public Slot slot() {
+        // rollback may reclaim the storage this slot points to
+        if (this.transaction != null && this.transaction.aborted) {
+            throw new IllegalStateException("Writer belongs to an aborted transaction");
+        }
+        return super.slot();
+    }
+
     // reload after freezing because copy-on-write may change where the slot points
     private void reloadSlot() throws IOException {
         if (this.transaction != null && this.transaction.frozenAt != null && this.slotPtr.position() != null) {
@@ -54,6 +63,7 @@ public class WriteCursor extends ReadCursor {
                 reloadSlot();
                 slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
             } catch (Exception | Error e) {
+                if (startsTransaction) this.db.transaction.aborted = true;
                 // only truncate when the error escapes the outer write.
                 // a nested callback's caller may still commit its work.
                 if (this.db.txStart == null) {
