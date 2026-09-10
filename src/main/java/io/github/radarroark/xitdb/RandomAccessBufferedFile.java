@@ -7,9 +7,10 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 
 public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoCloseable {
-    RandomAccessFile file;
+    public RandomAccessFile file;
     RandomAccessMemory memory;
     int bufferSize; // flushes when the memory is >= this size
     long filePos;
@@ -25,6 +26,14 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
         this.bufferSize = bufferSize;
         this.filePos = 0;
         this.memoryPos = 0;
+    }
+
+    /**
+     * Returns the underlying file channel for locking.
+     * Direct channel I/O bypasses this file's buffering and logical position.
+     */
+    public FileChannel getChannel() {
+        return this.file.getChannel();
     }
 
     public void seek(long pos) throws IOException {
