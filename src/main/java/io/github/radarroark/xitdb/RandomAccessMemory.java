@@ -31,8 +31,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
 
     public synchronized void setLength(int len) throws IOException {
         if (len < 0 || len > this.count) throw new IllegalArgumentException();
-        // Prepare the cursor before changing the length: ThreadLocal boxing can
-        // allocate. Keep the backing buffer so rollback never copies the database.
+        // update the position first, since boxing can allocate.
         if (len == 0 || this.position.get() > len) {
             this.position.set(len);
         }
