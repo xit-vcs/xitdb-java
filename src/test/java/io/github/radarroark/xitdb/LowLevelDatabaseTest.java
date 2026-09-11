@@ -250,6 +250,33 @@ class LowLevelDatabaseTest {
             core.seek(core.length() + 1);
             assertThrows(EOFException.class, () -> core.reader().readFully(new byte[1]));
         }
+
+        try (var core = new CoreMemory(new RandomAccessMemory())) {
+            var bytes = new byte[]{1, 2, 3, 4};
+            core.writer().write(bytes);
+            core.seek(1);
+
+            // invalid lengths must leave the contents and position alone
+            for (int length : new int[]{5, -1, Integer.MIN_VALUE}) {
+                assertThrows(IllegalArgumentException.class, () -> core.setLength(length));
+                assertEquals(1, core.position());
+                assertArrayEquals(bytes, core.memory.toByteArray());
+            }
+
+            // truncation preserves an earlier position and clamps one past the end
+            core.setLength(3);
+            assertEquals(1, core.position());
+            core.setLength(3);
+            assertEquals(1, core.position());
+            core.seek(3);
+            core.setLength(2);
+            assertEquals(2, core.length());
+            assertEquals(2, core.position());
+            assertArrayEquals(new byte[]{1, 2}, core.memory.toByteArray());
+            assertThrows(EOFException.class, () -> core.reader().readByte());
+            core.writer().writeByte(9);
+            assertArrayEquals(new byte[]{1, 2, 9}, core.memory.toByteArray());
+        }
     }
 
     void testSlice(Core core, Hasher hasher, int originalSize, long sliceOffset, long sliceSize) throws Exception {
