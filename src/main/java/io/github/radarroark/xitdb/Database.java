@@ -322,7 +322,7 @@ public class Database {
 
     protected SlotPointer readSlotPointer(WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
         if (pathI == path.length) {
-            if (writeMode == WriteMode.READ_ONLY && slotPtr.slot().tag() == Tag.NONE) {
+            if (writeMode == WriteMode.READ_ONLY && slotPtr.slot().empty()) {
                 throw new KeyNotFoundException();
             }
             return slotPtr;
