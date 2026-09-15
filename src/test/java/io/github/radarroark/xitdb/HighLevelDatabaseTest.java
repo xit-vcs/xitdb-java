@@ -1,6 +1,7 @@
 package io.github.radarroark.xitdb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -12,9 +13,11 @@ import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class HighLevelDatabaseTest {
     static long MAX_READ_BYTES = 1024;
@@ -981,7 +984,7 @@ class HighLevelDatabaseTest {
         try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             try (var targetCore = new CoreMemory(new RandomAccessMemory())) {
-                testCompaction(core, targetCore, hasher, null, null);
+                testCompaction(core, targetCore, hasher, null, null, null);
             }
         }
 
@@ -995,7 +998,7 @@ class HighLevelDatabaseTest {
             try (var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
                  var targetCore = new CoreFile(new RandomAccessFile(targetFile, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
+                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, null);
             }
         }
 
@@ -1009,7 +1012,7 @@ class HighLevelDatabaseTest {
             try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
                  var targetCore = new CoreBufferedFile(new RandomAccessBufferedFile(targetFile, "rw"))) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile);
+                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, null);
             }
         }
 
@@ -1021,18 +1024,41 @@ class HighLevelDatabaseTest {
             try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
                  var targetCore = new CoreMemory(new RandomAccessMemory())) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testCompaction(sourceCore, targetCore, hasher, sourceFile, null);
+                testCompaction(sourceCore, targetCore, hasher, sourceFile, null, null);
             }
         }
     }
 
-    void testCompaction(Core sourceCore, Core targetCore, Hasher hasher, File sourceFile, File targetFile) throws Exception {
+    @Test
+    void testCompactionWithDiskBackedOffsetsMap(@TempDir Path tempDir) throws Exception {
+        var offsetsFile = tempDir.resolve("compact_offsets.db").toFile();
+        var sourceFile = tempDir.resolve("compact_source.db").toFile();
+        var targetFile = tempDir.resolve("compact_target.db").toFile();
+
+        try (var offsetMap = new FileOffsetMap(new RandomAccessFile(offsetsFile, "rw"));
+             var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
+             var targetCore = new CoreFile(new RandomAccessFile(targetFile, "rw"))) {
+            // reusing a scratch map must discard offsets from previous compactions
+            offsetMap.put(0, 123);
+
+            // reuse the existing data type, cycle, sharing, and reopening checks
+            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+            testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, offsetMap);
+            assertNull(offsetMap.get(0));
+        }
+    }
+
+    private Database compact(Database source, Core targetCore, OffsetMap offsetMap) throws Exception {
+        return offsetMap == null ? source.compact(targetCore) : source.compact(targetCore, offsetMap);
+    }
+
+    void testCompaction(Core sourceCore, Core targetCore, Hasher hasher, File sourceFile, File targetFile, OffsetMap offsetMap) throws Exception {
         // empty DB compaction
         {
             sourceCore.setLength(0);
             targetCore.setLength(0);
             var source = new Database(sourceCore, hasher);
-            var compacted = source.compact(targetCore);
+            var compacted = compact(source, targetCore, offsetMap);
             assertEquals(Tag.NONE, compacted.header.tag());
         }
 
@@ -1137,7 +1163,7 @@ class HighLevelDatabaseTest {
             var sourceSize = sourceCore.length();
 
             // compact
-            var compacted = source.compact(targetCore);
+            var compacted = compact(source, targetCore, offsetMap);
 
             var targetSize = targetCore.length();
 
@@ -1262,7 +1288,7 @@ class HighLevelDatabaseTest {
                 });
             }
 
-            var compacted = source.compact(targetCore);
+            var compacted = compact(source, targetCore, offsetMap);
 
             var history = new ReadArrayList(compacted.rootCursor());
             assertEquals(1, history.count());
@@ -1299,7 +1325,7 @@ class HighLevelDatabaseTest {
                 }
 
                 // compact
-                source.compact(targetCore);
+                compact(source, targetCore, offsetMap);
 
                 // re-open the target
                 targetCore.seek(0);
@@ -1330,7 +1356,7 @@ class HighLevelDatabaseTest {
                 }
 
                 // compact
-                var compacted = source.compact(targetCore);
+                var compacted = compact(source, targetCore, offsetMap);
 
                 // add new moment to compacted DB
                 {

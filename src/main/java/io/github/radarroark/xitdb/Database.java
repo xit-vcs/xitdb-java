@@ -143,7 +143,30 @@ public class Database {
     }
 
     public Database compact(Core targetCore) throws Exception {
-        var offsetMap = new HashMap<Long, Long>();
+        return compact(targetCore, new OffsetMap() {
+            private final HashMap<Long, Long> offsets = new HashMap<>();
+
+            @Override
+            public void reset() {
+                offsets.clear();
+            }
+
+            @Override
+            public Long get(long sourceOffset) {
+                return offsets.get(sourceOffset);
+            }
+
+            @Override
+            public void put(long sourceOffset, long targetOffset) {
+                offsets.put(sourceOffset, targetOffset);
+            }
+        });
+    }
+
+    /** resets and borrows the supplied offsets map without closing it. */
+    public Database compact(Core targetCore, OffsetMap offsetMap) throws Exception {
+        // cached offsets only apply to this compaction's target
+        offsetMap.reset();
         var hasher = new Hasher(this.md, this.header.hashId());
         var target = new Database(targetCore, hasher);
 
@@ -2796,9 +2819,9 @@ public class Database {
         private final Core sourceCore;
         private final Core targetCore;
         private final short hashSize;
-        private final HashMap<Long, Long> offsetMap;
+        private final OffsetMap offsetMap;
 
-        private Compactor(Core sourceCore, Core targetCore, short hashSize, HashMap<Long, Long> offsetMap) {
+        private Compactor(Core sourceCore, Core targetCore, short hashSize, OffsetMap offsetMap) {
             this.sourceCore = sourceCore;
             this.targetCore = targetCore;
             this.hashSize = hashSize;
@@ -2863,7 +2886,7 @@ public class Database {
             }
         }
 
-        private long remapBytes(Slot slot) throws IOException {
+        private long remapBytes(Slot slot) throws Exception {
             var mapped = offsetMap.get(slot.value());
             if (mapped != null) return mapped;
 
