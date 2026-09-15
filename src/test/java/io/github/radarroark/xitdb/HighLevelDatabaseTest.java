@@ -1182,16 +1182,19 @@ class HighLevelDatabaseTest {
             // objects rather than duplicate objects or dangling source offsets.
             var selfCursor = moment.getCursor("self");
             assertEquals(momentCursor.slot(), selfCursor.slot());
+            assertEquals(momentCursor.slot().valueOffset().longValue(), selfCursor.slot().valueOffset().longValue());
 
             var cyclicListCursor = moment.getCursor("cyclic-list");
             var cyclicList = new ReadArrayList(cyclicListCursor);
             assertEquals(cyclicListCursor.slot(), cyclicList.getSlot(0));
+            assertEquals(cyclicListCursor.slot().valueOffset().longValue(), cyclicList.getSlot(0).valueOffset().longValue());
 
             var mapACursor = moment.getCursor("map-a");
             var mapA = new ReadHashMap(mapACursor);
             var mapBCursor = mapA.getCursor("map-b");
             var mapB = new ReadHashMap(mapBCursor);
             assertEquals(mapACursor.slot(), mapB.getSlot("map-a"));
+            assertEquals(mapACursor.slot().valueOffset().longValue(), mapB.getSlot("map-a").valueOffset().longValue());
 
             // key1 should have the final value
             assertEquals("final_value", new String(moment.getCursor("key1").readBytes(MAX_READ_BYTES)));
