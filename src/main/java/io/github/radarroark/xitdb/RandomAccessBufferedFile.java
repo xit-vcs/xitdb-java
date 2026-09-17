@@ -224,7 +224,8 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
 
         // read from the disk -- before the in-memory buffer
         if (this.filePos < this.memoryPos) {
-            int sizeBeforeMem = Math.min((int) (this.memoryPos - this.filePos), buffer.length);
+            // compare as longs, because the buffer can be more than 2 GiB away
+            int sizeBeforeMem = (int) Math.min(this.memoryPos - this.filePos, (long) buffer.length);
             this.file.seek(this.filePos);
             this.file.readFully(buffer, 0, sizeBeforeMem);
             pos += sizeBeforeMem;
