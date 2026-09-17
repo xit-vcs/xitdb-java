@@ -12,9 +12,14 @@ import java.nio.channels.FileChannel;
 public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoCloseable {
     public RandomAccessFile file;
     RandomAccessMemory memory;
-    int bufferSize; // flushes when the memory is >= this size
+    int bufferSize; // flushes before the memory would grow beyond this size
     long filePos;
     long memoryPos;
+    // the file's length, cached so that `length` doesn't need to ask the OS
+    // every time data is allocated. another process may write to the file
+    // whenever this one isn't, so it is only set once we begin writing, and
+    // it is cleared when the writes are flushed.
+    Long fileLen = null;
 
     public RandomAccessBufferedFile(File file, String mode) throws FileNotFoundException {
         this(file, mode, 8 * 1024 * 1024);
@@ -37,25 +42,16 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
     }
 
     public void seek(long pos) throws IOException {
-        // flush if we are going past the end of the in-memory buffer
-        if (pos > this.memoryPos + this.memory.size()) {
-            this.flush();
-        }
-
         this.filePos = pos;
-
-        // if the buffer is empty, set its position to this offset as well
-        if (this.memory.size() == 0) {
-            this.memoryPos = pos;
-        }
     }
 
     public long length() throws IOException {
+        long fileLen = this.fileLen != null ? this.fileLen : this.file.length();
         var bufferSize = this.memory.size();
-        // a failed allocation after seeking past eof can leave an empty
-        // buffer beyond the file's end, even after rollback.
-        if (bufferSize == 0) return this.file.length();
-        return Math.max(this.memoryPos + bufferSize, this.file.length());
+        // a failed allocation or a rollback can leave an empty
+        // buffer positioned beyond the file's end.
+        if (bufferSize == 0) return fileLen;
+        return Math.max(this.memoryPos + bufferSize, fileLen);
     }
 
     public long position() throws IOException {
@@ -71,18 +67,28 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
         } else if (len < this.memoryPos + this.memory.size()) {
             this.memory.setLength((int) (len - this.memoryPos));
         }
+        this.fileLen = null;
         this.file.setLength(len);
         this.filePos = Math.min(len, this.filePos);
     }
 
     public void flush() throws IOException {
+        this.fileLen = null;
         if (this.memory.size() > 0) {
-            this.file.seek(this.memoryPos);
-            this.file.write(this.memory.toByteArray());
-
-            this.memoryPos = 0;
+            writeToFile(this.memoryPos, this.memory.toByteArray());
             this.memory.reset();
         }
+    }
+
+    private void writeToFile(long pos, byte[] buffer) throws IOException {
+        // if the write fails partway, the file's length is unknown
+        var fileLen = this.fileLen;
+        this.fileLen = null;
+
+        this.file.seek(pos);
+        this.file.write(buffer);
+
+        if (fileLen != null) this.fileLen = Math.max(fileLen, pos + buffer.length);
     }
 
     public void sync() throws IOException {
@@ -103,11 +109,26 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
 
     @Override
     public void write(byte[] buffer) throws IOException {
-        if (this.memory.size() + buffer.length > this.bufferSize) {
+        if (buffer.length == 0) return;
+
+        // the in-memory buffer is a single contiguous window of the file
+        // starting at memoryPos. start a new window at this position if
+        // the buffer is empty, the write is past the end of the window,
+        // or the write would grow the window beyond the max size.
+        var memorySize = this.memory.size();
+        if (memorySize == 0
+                || this.filePos > this.memoryPos + memorySize
+                || (this.filePos >= this.memoryPos && this.filePos - this.memoryPos + buffer.length > this.bufferSize)) {
             this.flush();
+            this.memoryPos = this.filePos;
         }
 
-        if (this.filePos >= this.memoryPos && this.filePos <= this.memoryPos + this.memory.size()) {
+        if (this.fileLen == null) {
+            this.fileLen = this.file.length();
+        }
+
+        if (this.filePos >= this.memoryPos && this.filePos - this.memoryPos + buffer.length <= this.bufferSize) {
+            // write to the in-memory buffer
             this.memory.seek((int) (this.filePos - this.memoryPos));
             this.memory.write(buffer);
         } else {
@@ -116,8 +137,7 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
             if (this.filePos < this.memoryPos + this.memory.size() && this.filePos + buffer.length > this.memoryPos) {
                 this.flush();
             }
-            this.file.seek(this.filePos);
-            this.file.write(buffer);
+            writeToFile(this.filePos, buffer);
         }
 
         this.filePos += buffer.length;
