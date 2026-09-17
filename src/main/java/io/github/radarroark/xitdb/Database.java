@@ -66,11 +66,7 @@ public class Database {
             this.header.write(core);
             this.core.flush();
         } else {
-            this.header = Header.read(core);
-            this.header.validate();
-            if (this.header.hashSize() != this.md.getDigestLength()) {
-                throw new InvalidHashSizeException();
-            }
+            this.header = readAndValidateHeader();
             validateCommittedSize();
         }
 
@@ -113,19 +109,35 @@ public class Database {
         return digest.digest();
     }
 
-    public WriteCursor rootCursor() throws IOException {
-        // refresh until another database initializes the root
+    private Header readAndValidateHeader() throws IOException {
+        core.seek(0);
+        var header = Header.read(core);
+        header.validate();
+        if (header.hashSize() != this.md.getDigestLength()) {
+            throw new InvalidHashSizeException();
+        }
+        return header;
+    }
+
+    // the root tag only changes once, when the top-level data is initialized.
+    // if we haven't seen that happen, another instance may have done it since
+    // we read the header.
+    Header refreshHeader() throws IOException {
         var header = this.header;
         if (header.tag() == Tag.NONE) {
             synchronized (this) {
                 header = this.header;
                 if (header.tag() == Tag.NONE) {
-                    core.seek(0);
-                    header = Header.read(core);
+                    header = readAndValidateHeader();
                     this.header = header;
                 }
             }
         }
+        return header;
+    }
+
+    public WriteCursor rootCursor() throws IOException {
+        var header = refreshHeader();
         return new WriteCursor(new SlotPointer(null, new Slot(DATABASE_START, header.tag)), this);
     }
 
