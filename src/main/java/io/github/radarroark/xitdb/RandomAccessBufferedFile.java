@@ -63,7 +63,14 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
     }
 
     public void setLength(long len) throws IOException {
-        flush();
+        // discard buffered bytes past the new end rather than flushing them.
+        // a rollback must not depend on writing the data it is throwing away,
+        // because that write may be what failed (e.g. the disk is full).
+        if (len <= this.memoryPos) {
+            this.memory.reset();
+        } else if (len < this.memoryPos + this.memory.size()) {
+            this.memory.setLength((int) (len - this.memoryPos));
+        }
         this.file.setLength(len);
         this.filePos = Math.min(len, this.filePos);
     }
