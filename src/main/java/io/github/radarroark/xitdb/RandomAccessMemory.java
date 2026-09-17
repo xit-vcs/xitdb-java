@@ -6,7 +6,6 @@ import java.io.DataOutput;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 
 public class RandomAccessMemory extends ByteArrayOutputStream implements DataOutput, DataInput {
     // per-thread positions; synchronized access to shared bytes and size
@@ -44,6 +43,22 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
         return this.buf;
     }
 
+    // positional access, which doesn't use the per-thread position.
+    // for callers that track their own position, this avoids a
+    // thread-local lookup and a boxed integer on every call.
+
+    synchronized void writeAt(int pos, byte[] buffer) {
+        if (pos < 0 || pos > this.count) throw new IndexOutOfBoundsException();
+        int bytesBeforeEnd = Math.min(buffer.length, this.count - pos);
+        System.arraycopy(buffer, 0, this.buf, pos, bytesBeforeEnd);
+        super.write(buffer, bytesBeforeEnd, buffer.length - bytesBeforeEnd);
+    }
+
+    synchronized void readAt(int pos, byte[] b, int off, int len) throws IOException {
+        if (pos > this.count - len) throw new EOFException();
+        System.arraycopy(this.buf, pos, b, off, len);
+    }
+
     // ByteArrayOutputStream
 
     @Override
@@ -57,20 +72,8 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
     @Override
     public synchronized void write(byte[] buffer) throws IOException {
         int pos = this.position.get();
-        if (pos < this.count) {
-            int bytesBeforeEnd = Math.min(buffer.length, this.count - pos);
-            for (int i = 0; i < bytesBeforeEnd; i++) {
-                this.buf[pos + i] = buffer[i];
-            }
-
-            if (bytesBeforeEnd < buffer.length) {
-                int bytesAfterEnd = buffer.length - bytesBeforeEnd;
-                super.write(Arrays.copyOfRange(buffer, buffer.length - bytesAfterEnd, buffer.length));
-            }
-        } else {
-            super.write(buffer);
-        }
-
+        // another thread may have truncated the memory since this one's seek
+        writeAt(Math.min(pos, this.count), buffer);
         this.position.set(pos + buffer.length);
     }
 
@@ -143,8 +146,7 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
     @Override
     public synchronized void readFully(byte[] b, int off, int len) throws IOException {
         int pos = this.position.get();
-        if (pos > this.count - len) throw new EOFException();
-        System.arraycopy(this.buf, pos, b, off, len);
+        readAt(pos, b, off, len);
         this.position.set(pos + len);
     }
 
