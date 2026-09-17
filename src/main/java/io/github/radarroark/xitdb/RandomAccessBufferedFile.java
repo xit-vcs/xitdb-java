@@ -2,6 +2,7 @@ package io.github.radarroark.xitdb;
 
 import java.io.DataInput;
 import java.io.DataOutput;
+import java.io.EOFException;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -75,20 +76,40 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
     public void flush() throws IOException {
         this.fileLen = null;
         if (this.memory.size() > 0) {
-            writeToFile(this.memoryPos, this.memory.toByteArray());
+            writeToFile(this.memoryPos, this.memory.buffer(), 0, this.memory.size());
             this.memory.reset();
         }
     }
 
-    private void writeToFile(long pos, byte[] buffer) throws IOException {
+    // the channel reads and writes at a given position, which avoids the separate
+    // seek that RandomAccessFile needs. it copies through a native buffer that it
+    // keeps for the life of the thread, so large transfers are done in chunks.
+    private static final int MAX_TRANSFER_SIZE = 1024 * 1024;
+
+    private void writeToFile(long pos, byte[] buffer, int off, int len) throws IOException {
         // if the write fails partway, the file's length is unknown
         var fileLen = this.fileLen;
         this.fileLen = null;
 
-        this.file.seek(pos);
-        this.file.write(buffer);
+        var channel = this.file.getChannel();
+        var src = ByteBuffer.wrap(buffer, off, len);
+        int end = off + len;
+        while (src.position() < end) {
+            src.limit(src.position() + Math.min(end - src.position(), MAX_TRANSFER_SIZE));
+            channel.write(src, pos + (src.position() - off));
+        }
 
-        if (fileLen != null) this.fileLen = Math.max(fileLen, pos + buffer.length);
+        if (fileLen != null) this.fileLen = Math.max(fileLen, pos + len);
+    }
+
+    private void readFromFile(long pos, byte[] buffer, int off, int len) throws IOException {
+        var channel = this.file.getChannel();
+        var dst = ByteBuffer.wrap(buffer, off, len);
+        int end = off + len;
+        while (dst.position() < end) {
+            dst.limit(dst.position() + Math.min(end - dst.position(), MAX_TRANSFER_SIZE));
+            if (channel.read(dst, pos + (dst.position() - off)) < 0) throw new EOFException();
+        }
     }
 
     public void sync() throws IOException {
@@ -100,9 +121,14 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
 
     @Override
     public void close() throws IOException {
-        flush();
-        this.file.close();
-        this.memory.close();
+        try {
+            flush();
+        } finally {
+            // close the file even if the flush fails, so that
+            // its handle and any lock on it are released
+            this.file.close();
+            this.memory.close();
+        }
     }
 
     // DataOutput
@@ -137,7 +163,7 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
             if (this.filePos < this.memoryPos + this.memory.size() && this.filePos + buffer.length > this.memoryPos) {
                 this.flush();
             }
-            writeToFile(this.filePos, buffer);
+            writeToFile(this.filePos, buffer, 0, buffer.length);
         }
 
         this.filePos += buffer.length;
@@ -226,8 +252,7 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
         if (this.filePos < this.memoryPos) {
             // compare as longs, because the buffer can be more than 2 GiB away
             int sizeBeforeMem = (int) Math.min(this.memoryPos - this.filePos, (long) buffer.length);
-            this.file.seek(this.filePos);
-            this.file.readFully(buffer, 0, sizeBeforeMem);
+            readFromFile(this.filePos, buffer, 0, sizeBeforeMem);
             pos += sizeBeforeMem;
             this.filePos += sizeBeforeMem;
         }
@@ -249,8 +274,7 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
         // read from the disk -- after the in-memory buffer
         if (this.filePos >= this.memoryPos + this.memory.size()) {
             int sizeAfterMem = (int) (buffer.length - pos);
-            this.file.seek(this.filePos);
-            this.file.readFully(buffer, pos, sizeAfterMem);
+            readFromFile(this.filePos, buffer, pos, sizeAfterMem);
             pos += sizeAfterMem;
             this.filePos += sizeAfterMem;
         }

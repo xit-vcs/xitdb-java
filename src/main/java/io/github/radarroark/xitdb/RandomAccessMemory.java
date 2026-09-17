@@ -38,6 +38,12 @@ public class RandomAccessMemory extends ByteArrayOutputStream implements DataOut
         this.count = len;
     }
 
+    // the backing array, which is valid up to size().
+    // unlike toByteArray, this doesn't make a copy.
+    synchronized byte[] buffer() {
+        return this.buf;
+    }
+
     // ByteArrayOutputStream
 
     @Override
