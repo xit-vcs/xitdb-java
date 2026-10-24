@@ -5,8 +5,8 @@ import java.io.IOException;
 public class ReadLinkedArrayList implements Slotted, Iterable<ReadCursor> {
     public ReadCursor cursor;
 
-    public ReadLinkedArrayList(ReadCursor cursor) {
-        switch (cursor.slotPtr.slot().tag()) {
+    public ReadLinkedArrayList(ReadCursor cursor) throws IOException {
+        switch (cursor.resolved().slot().tag()) {
             case NONE, LINKED_ARRAY_LIST -> {
                 this.cursor = cursor;
             }

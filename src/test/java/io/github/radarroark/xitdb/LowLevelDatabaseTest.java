@@ -92,7 +92,9 @@ class LowLevelDatabaseTest {
     void testExpiredWriters() throws Exception {
         var db = new Database(new CoreMemory(new RandomAccessMemory()), new Hasher(MessageDigest.getInstance("SHA-1")));
         var history = new WriteArrayList(db.rootCursor());
-        assertThrows(Database.CursorNotWriteableException.class, () -> db.rootCursor().writePath(new Database.PathPart[]{
+        // in streaming mode, the callback runs inside a transaction on the root,
+        // so the top-level write inside it is a nested one
+        assertThrows(IllegalStateException.class, () -> db.rootCursor().writePath(new Database.PathPart[]{
             new Database.Context(cursor -> history.append(new Database.Int(999)))
         }));
         assertEquals(0, history.count());
@@ -199,29 +201,38 @@ class LowLevelDatabaseTest {
     }
 
     @Test
+    void testCrc64Xz() throws Exception {
+        // the standard check value of CRC-64/XZ
+        assertEquals(0x995dc9bbdf1939faL, Crc64Xz.hash("123456789".getBytes("UTF-8")));
+        assertEquals(0L, Crc64Xz.hash(new byte[0]));
+    }
+
+    @Test
     void testLowLevelApi() throws Exception {
-        try (var core = new CoreMemory(new RandomAccessMemory())) {
-            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            testLowLevelApi(core, hasher);
-        }
-
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
-
-            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+        for (boolean legacy : new boolean[]{true, false}) {
+            try (var core = new CoreMemory(new RandomAccessMemory())) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testLowLevelApi(core, hasher);
+                testLowLevelApi(core, hasher, legacy);
             }
-        }
 
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
 
-            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw", 1024))) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testLowLevelApi(core, hasher);
+                try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testLowLevelApi(core, hasher, legacy);
+                }
+            }
+
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
+
+                try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw", 1024))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testLowLevelApi(core, hasher, legacy);
+                }
             }
         }
     }
@@ -232,18 +243,25 @@ class LowLevelDatabaseTest {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
             var db = new Database(core, hasher);
 
+            // every write to the root is a transaction, so the bytes are
+            // written inside one
             var hash = db.hash("text".getBytes("UTF-8"));
-            var textCursor = db.rootCursor().writePath(new Database.PathPart[]{
-                new Database.HashMapInit(),
-                new Database.HashMapGet(new Database.HashMapGetValue(hash)),
+            db.runContext(cursor -> {
+                var textCursor = cursor.writePath(new Database.PathPart[]{
+                    new Database.HashMapInit(),
+                    new Database.HashMapGet(new Database.HashMapGetValue(hash)),
+                });
+
+                var writer = textCursor.writer();
+                writer.write("goodbye, world!".getBytes());
+                writer.seek(9);
+                writer.write("cruel world!".getBytes());
+                writer.finish();
             });
 
-            var writer = textCursor.writer();
-            writer.write("goodbye, world!".getBytes());
-            writer.seek(9);
-            writer.write("cruel world!".getBytes());
-            writer.finish();
-
+            var textCursor = db.rootCursor().readPath(new Database.PathPart[]{
+                new Database.HashMapGet(new Database.HashMapGetValue(hash)),
+            });
             var reader = textCursor.reader();
             assertEquals("goodbye, cruel world!", new String(reader.readAllBytes()));
 
@@ -279,9 +297,9 @@ class LowLevelDatabaseTest {
         }
     }
 
-    void testSlice(Core core, Hasher hasher, int originalSize, long sliceOffset, long sliceSize) throws Exception {
+    void testSlice(Core core, Hasher hasher, int originalSize, long sliceOffset, long sliceSize, boolean legacy) throws Exception {
         core.setLength(0);
-        var db = new Database(core, hasher);
+        var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
         var rootCursor = db.rootCursor();
 
         rootCursor.writePath(new Database.PathPart[]{
@@ -380,9 +398,9 @@ class LowLevelDatabaseTest {
         });
     }
 
-    void testConcat(Core core, Hasher hasher, long listASize, long listBSize) throws Exception {
+    void testConcat(Core core, Hasher hasher, long listASize, long listBSize, boolean legacy) throws Exception {
         core.setLength(0);
-        var db = new Database(core, hasher);
+        var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
         var rootCursor = db.rootCursor();
 
         var values = new ArrayList<Long>();
@@ -481,9 +499,9 @@ class LowLevelDatabaseTest {
         });
     }
 
-    void testInsertAndRemove(Core core, Hasher hasher, int originalSize, long insertIndex) throws Exception {
+    void testInsertAndRemove(Core core, Hasher hasher, int originalSize, long insertIndex, boolean legacy) throws Exception {
         core.setLength(0);
-        var db = new Database(core, hasher);
+        var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
         var rootCursor = db.rootCursor();
 
         long insertValue = 12345;
@@ -605,21 +623,21 @@ class LowLevelDatabaseTest {
         });
     }
 
-    void testLowLevelApi(Core core, Hasher hasher) throws Exception {
+    void testLowLevelApi(Core core, Hasher hasher, boolean legacy) throws Exception {
         // open and re-open database
         {
             // make empty database
             core.setLength(0);
-            new Database(core, hasher);
+            HighLevelDatabaseTest.initDb(core, hasher, legacy);
 
             // re-open without error
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var writer = db.core.writer();
             db.core.seek(0);
             writer.writeByte('g');
 
             // re-open with error
-            assertThrows(Database.InvalidDatabaseException.class, () -> new Database(core, hasher));
+            assertThrows(Database.InvalidDatabaseException.class, () -> HighLevelDatabaseTest.initDb(core, hasher, legacy));
 
             // modify the version
             db.core.seek(0);
@@ -628,7 +646,7 @@ class LowLevelDatabaseTest {
             writer.writeShort(Database.VERSION + 1);
 
             // re-open with error
-            assertThrows(Database.InvalidVersionException.class, () -> new Database(core, hasher));
+            assertThrows(Database.InvalidVersionException.class, () -> HighLevelDatabaseTest.initDb(core, hasher, legacy));
         }
 
         // save hash id in header
@@ -638,7 +656,7 @@ class LowLevelDatabaseTest {
 
             // make empty database
             core.setLength(0);
-            new Database(core, hasherWithHashId);
+            HighLevelDatabaseTest.initDb(core, hasherWithHashId, legacy);
 
             // read header without initializing database
             core.seek(0);
@@ -662,7 +680,7 @@ class LowLevelDatabaseTest {
         // array_list of hash_maps
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             // write foo -> bar with a writer
@@ -1379,7 +1397,7 @@ class LowLevelDatabaseTest {
         // append to top-level array_list many times, filling up the array_list until a root overflow occurs
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             var watKey = db.hash("wat".getBytes());
@@ -1472,7 +1490,7 @@ class LowLevelDatabaseTest {
         // append to inner array_list many times, filling up the array_list until a root overflow occurs
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             for (int i = 0; i < Database.SLOT_COUNT + 1; i++) {
@@ -1578,7 +1596,7 @@ class LowLevelDatabaseTest {
         // iterate over inner array_list
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             // add wats
@@ -1652,7 +1670,7 @@ class LowLevelDatabaseTest {
         // iterate over inner hash_map
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             // add wats
@@ -1750,33 +1768,33 @@ class LowLevelDatabaseTest {
 
         {
             // slice linked_array_list
-            testSlice(core, hasher, Database.SLOT_COUNT * 5 + 1, 10, 5);
-            testSlice(core, hasher, Database.SLOT_COUNT * 5 + 1, 0, Database.SLOT_COUNT * 2);
-            testSlice(core, hasher, Database.SLOT_COUNT * 5, Database.SLOT_COUNT * 3, Database.SLOT_COUNT);
-            testSlice(core, hasher, Database.SLOT_COUNT * 5, Database.SLOT_COUNT * 3, Database.SLOT_COUNT * 2);
-            testSlice(core, hasher, Database.SLOT_COUNT * 2, 10, Database.SLOT_COUNT);
-            testSlice(core, hasher, 2, 0, 2);
-            testSlice(core, hasher, 2, 1, 1);
-            testSlice(core, hasher, 1, 0, 0);
+            testSlice(core, hasher, Database.SLOT_COUNT * 5 + 1, 10, 5, legacy);
+            testSlice(core, hasher, Database.SLOT_COUNT * 5 + 1, 0, Database.SLOT_COUNT * 2, legacy);
+            testSlice(core, hasher, Database.SLOT_COUNT * 5, Database.SLOT_COUNT * 3, Database.SLOT_COUNT, legacy);
+            testSlice(core, hasher, Database.SLOT_COUNT * 5, Database.SLOT_COUNT * 3, Database.SLOT_COUNT * 2, legacy);
+            testSlice(core, hasher, Database.SLOT_COUNT * 2, 10, Database.SLOT_COUNT, legacy);
+            testSlice(core, hasher, 2, 0, 2, legacy);
+            testSlice(core, hasher, 2, 1, 1, legacy);
+            testSlice(core, hasher, 1, 0, 0, legacy);
 
             // concat linked_array_list
-            testConcat(core, hasher, Database.SLOT_COUNT * 5 + 1, Database.SLOT_COUNT + 1);
-            testConcat(core, hasher, Database.SLOT_COUNT, Database.SLOT_COUNT);
-            testConcat(core, hasher, 1, 1);
-            testConcat(core, hasher, 0, 0);
+            testConcat(core, hasher, Database.SLOT_COUNT * 5 + 1, Database.SLOT_COUNT + 1, legacy);
+            testConcat(core, hasher, Database.SLOT_COUNT, Database.SLOT_COUNT, legacy);
+            testConcat(core, hasher, 1, 1, legacy);
+            testConcat(core, hasher, 0, 0, legacy);
 
             // insert linked_array_list
-            testInsertAndRemove(core, hasher, 1, 0);
-            testInsertAndRemove(core, hasher, 10, 0);
-            testInsertAndRemove(core, hasher, 10, 5);
-            testInsertAndRemove(core, hasher, 10, 9);
-            testInsertAndRemove(core, hasher, Database.SLOT_COUNT * 5, Database.SLOT_COUNT * 2);
+            testInsertAndRemove(core, hasher, 1, 0, legacy);
+            testInsertAndRemove(core, hasher, 10, 0, legacy);
+            testInsertAndRemove(core, hasher, 10, 5, legacy);
+            testInsertAndRemove(core, hasher, 10, 9, legacy);
+            testInsertAndRemove(core, hasher, Database.SLOT_COUNT * 5, Database.SLOT_COUNT * 2, legacy);
         }
 
         // concat linked_array_list multiple times
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             rootCursor.writePath(new Database.PathPart[]{
@@ -1862,7 +1880,7 @@ class LowLevelDatabaseTest {
         // append items to linked_array_list without setting their value
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             // appending without setting any value should work
@@ -1892,7 +1910,7 @@ class LowLevelDatabaseTest {
         // insert at beginning of linked_array_list many times
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             rootCursor.writePath(new Database.PathPart[]{
@@ -1919,7 +1937,7 @@ class LowLevelDatabaseTest {
         // insert at end of linked_array_list many times
         {
             core.setLength(0);
-            var db = new Database(core, hasher);
+            var db = HighLevelDatabaseTest.initDb(core, hasher, legacy);
             var rootCursor = db.rootCursor();
 
             rootCursor.writePath(new Database.PathPart[]{

@@ -1,13 +1,15 @@
 package io.github.radarroark.xitdb;
 
+import java.io.IOException;
+
 public class ReadHashSet implements Slotted, Iterable<ReadCursor> {
     public ReadCursor cursor;
 
     protected ReadHashSet() {
     }
 
-    public ReadHashSet(ReadCursor cursor) {
-        switch (cursor.slotPtr.slot().tag()) {
+    public ReadHashSet(ReadCursor cursor) throws IOException {
+        switch (cursor.resolved().slot().tag()) {
             case NONE, HASH_MAP, HASH_SET -> {
                 this.cursor = cursor;
             }

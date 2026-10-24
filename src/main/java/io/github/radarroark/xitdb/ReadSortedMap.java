@@ -8,8 +8,8 @@ public class ReadSortedMap implements Slotted, Iterable<ReadCursor> {
     protected ReadSortedMap() {
     }
 
-    public ReadSortedMap(ReadCursor cursor) {
-        switch (cursor.slotPtr.slot().tag()) {
+    public ReadSortedMap(ReadCursor cursor) throws IOException {
+        switch (cursor.resolved().slot().tag()) {
             case NONE, SORTED_MAP, SORTED_SET -> {
                 this.cursor = cursor;
             }
@@ -102,8 +102,9 @@ public class ReadSortedMap implements Slotted, Iterable<ReadCursor> {
 
     // number of keys strictly less than key (the inverse of getIndexKeyValuePair)
     public long rank(byte[] key) throws IOException {
-        if (this.cursor.slotPtr.slot().tag() == Tag.NONE) return 0;
-        this.cursor.db.core.seek(this.cursor.slotPtr.slot().value());
+        var slotPtr = this.cursor.resolved();
+        if (slotPtr.slot().tag() == Tag.NONE) return 0;
+        this.cursor.db.core.seek(slotPtr.slot().value());
         var reader = this.cursor.db.core.reader();
         var headerBytes = new byte[Database.BTreeHeader.length];
         reader.readFully(headerBytes);

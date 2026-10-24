@@ -30,6 +30,7 @@ This database was originally made for the [xit version control system](https://g
 * [Iterators](#iterators)
 * [Hashing](#hashing)
 * [Compaction](#compaction)
+* [Replication](#replication)
 * [Thread Safety](#thread-safety)
 
 ## Example
@@ -44,8 +45,8 @@ try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(new File("main
     var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
     var db = new Database(core, hasher);
 
-    // to get the benefits of immutability, the top-level data structure
-    // must be an ArrayList, so each transaction is stored as an item in it
+    // the top-level data structure is an ArrayList, so each transaction is
+    // stored as an item in it, and past copies of the db stay readable
     var history = new WriteArrayList(db.rootCursor());
 
     // this is how a transaction is executed. we call history.appendContext,
@@ -125,9 +126,11 @@ A `Database` is initialized with an implementation of the `Core` interface, whic
 
 Every `Core` implements `AutoCloseable` and owns the file or memory passed to its constructor. Use try-with-resources on the core rather than on the underlying resource so buffered data is flushed before the resource is closed.
 
-Usually, you want to use a top-level `ArrayList` like in the example above, because that allows you to store a reference to each copy of the database (which I call a "moment"). This is how it supports transactions, despite not having any rollback journal or write-ahead log. It's an append-only database, so the data you are writing is invisible to any reader until the very last step, when the top-level list's header is updated.
+Since xitdb is an append-only database, the data you are writing is invisible to any reader until the very last step, when a small header at the start of the file is updated to point at it. This is how it supports transactions, despite not having any rollback journal or write-ahead log: if a transaction fails, the data it appended is simply discarded.
 
-You can also use a top-level `HashMap`, which is useful for ephemeral databases where immutability or transaction safety isn't necessary. Since xitdb supports in-memory databases, you could use it as an over-the-wire serialization format. Much like "Cap'n Proto", xitdb has no encoding/decoding step: you just give the buffer to xitdb and it can immediately read from it.
+Usually, you want to use a top-level `ArrayList` like in the example above, because that allows you to store a reference to each copy of the database (which I call a "moment"), so past copies stay readable and can be reverted to. If you don't need to keep past copies, you can also use a top-level `HashMap`. Keep in mind that each write to a top-level `HashMap` is its own transaction, so if you make many writes, group them into one transaction with `runContext`.
+
+Since xitdb supports in-memory databases, you could use it as an over-the-wire serialization format. Much like "Cap'n Proto", xitdb has no encoding/decoding step: you just give the buffer to xitdb and it can immediately read from it. You can send it over a network and read it with xitdb on the other end.
 
 ## Types
 
@@ -549,6 +552,8 @@ Normally, an immutable database grows forever, because old data is never deleted
 
 ```java
 try (var compactCore = new CoreBufferedFile(new RandomAccessBufferedFile(new File("compact.db"), "rw"))) {
+    // start from an empty file
+    compactCore.setLength(0);
     var compactDb = db.compact(compactCore);
 
     // read from the new compacted db
@@ -557,24 +562,74 @@ try (var compactCore = new CoreBufferedFile(new RandomAccessBufferedFile(new Fil
 }
 ```
 
-This compacted database will be in a separate file. If you want to delete the original database and replace it with this one, you'll need to do that yourself. It is not possible to compact a database in-place (using the same file as the target database); doing so would fail and would render your original database unreadable.
+This compacted database will be in a separate file. If you want to delete the original database and replace it with this one, you'll need to do that yourself. The target must be a new or empty database, so compaction throws `TargetNotEmptyException` if it already has data, including when it is the original database's own file.
 
-The offsets map records where each copied object lives in the compacted database so shared references and cycles point to the same copied object. It grows with the number of live objects copied, so it could theoretically OOM. To avoid this, you can instead use a temporary on-disk xitdb file to track the offsets with [FileOffsetMap](src/main/java/io/github/radarroark/xitdb/FileOffsetMap.java):
+The offsets map records where each copied object lives in the compacted database so shared references and cycles point to the same copied object. It grows with the number of live objects copied, so it could theoretically OOM. To avoid this, you can instead use a temporary on-disk xitdb file to track the offsets with [FileOffsetMap](src/main/java/io/github/radarroark/xitdb/FileOffsetMap.java). Run the compaction inside a single transaction on it, so the offsets aren't each committed separately:
 
 ```java
-// create a scratch file and delete it when compaction is finished
+// create a scratch database and delete it when compaction is finished
 var offsetsFile = File.createTempFile("compact_offsets", ".db");
-try (var offsetMap = new FileOffsetMap(new RandomAccessFile(offsetsFile, "rw"));
+try (var offsetsCore = new CoreFile(new RandomAccessFile(offsetsFile, "rw"));
      var compactCore = new CoreBufferedFile(new RandomAccessBufferedFile(new File("compact.db"), "rw"))) {
-    var compactDb = db.compact(compactCore, offsetMap);
+    var offsetsDb = new Database(offsetsCore, new Hasher(MessageDigest.getInstance("SHA-256")));
+
+    // start from an empty file
+    compactCore.setLength(0);
+
+    // compact inside a transaction on the scratch database
+    var compactDb = new Database[1];
+    offsetsDb.runContext((cursor) -> {
+        var offsetMap = new FileOffsetMap(new WriteHashMap(cursor));
+        compactDb[0] = db.compact(compactCore, offsetMap);
+    });
 
     // read from the new compacted db
-    var history = new ReadArrayList(compactDb.rootCursor());
+    var history = new ReadArrayList(compactDb[0].rootCursor());
     assertEquals(1, history.count());
 } finally {
     Files.deleteIfExists(offsetsFile.toPath());
 }
 ```
+
+## Replication
+
+Since xitdb files are append-only, it is absurdly easy to replicate them: just copy the bytes that the destination doesn't have yet! Other databases like SQLite require complex external tools to replicate. In xitdb, once a transaction is committed, its bytes never change, except for a small header that points at the latest commit. That makes it easy to keep a copy of a database (a "replica") up to date, whether it's another file on the same machine or on another machine across a network.
+
+A sync takes four steps:
+
+```java
+// on the replica: describe what it already has
+var state = replica.replicaState();
+
+// on the source: decide which bytes to send
+var start = source.replicationStart(state);
+var end = source.committedSize();
+
+// on the source: write those bytes
+var buffer = new ByteArrayOutputStream();
+source.readCommitted(start, end, buffer);
+
+// on the replica: apply them
+var reader = new ByteArrayInputStream(buffer.toByteArray());
+replica.applyReplicated(start, reader, end - start);
+```
+
+Over a network, the replica sends its `ReplicaState` (two longs: its committed size and a checksum of its latest commit), and the source replies with `start`, the length, and then the bytes. Since `readCommitted` takes an `OutputStream` and `applyReplicated` takes an `InputStream`, the bytes can be streamed directly over the connection without buffering them in memory.
+
+If your code would rather pull the bytes from the source or push them into the replica, use `openCommitted(start, end)`, which returns an `InputStream`, and `openReplicated(start, len)`, which returns an `OutputStream` that commits the bytes when it is closed. For example, they can be connected with `transferTo`:
+
+```java
+try (var in = source.openCommitted(start, end);
+     var out = replica.openReplicated(start, end - start)) {
+    in.transferTo(out);
+}
+```
+
+A replica can start out as any new database. Each database has a random file ID, so the first sync sees that the replica isn't a copy of the source and sends the entire source file, replacing the replica. The same happens if the replica can no longer be extended, such as when the source is replaced by a compacted copy (which is a new file) or restored from an older backup: `replicationStart` returns 0, and the replica is replaced with a full copy.
+
+If a sync is interrupted, such as by a dropped connection, the replica stays at its last commit, and the next sync discards whatever was partially written. The exception is when `start` is 0: the replica is truncated before the copy begins, so an interrupted copy leaves it unusable until the next sync succeeds. If that matters to you, check whether `start` is 0, and if so, write the copy to a new file and only replace the old replica after `applyReplicated` succeeds.
+
+Only change a replica with `applyReplicated`. If you write to it directly, it no longer matches the source, and the next sync will replace it.
 
 ## Thread Safety
 

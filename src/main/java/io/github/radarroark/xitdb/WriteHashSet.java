@@ -47,12 +47,13 @@ public class WriteHashSet extends ReadHashSet {
     // methods that take a hash directly
 
     public void put(byte[] hash, Database.WriteableData data) throws Exception {
-        var cursor = ((WriteCursor)this.cursor).writePath(new Database.PathPart[]{
-            new Database.HashMapGet(new Database.HashMapGetKey(hash)),
-        });
         // keys are only written if empty, because their value should always
-        // be the same at a given hash.
-        cursor.writeIfEmpty(data);
+        // be the same at a given hash. the key is written in the same path,
+        // so it is one transaction when this is the root.
+        ((WriteCursor)this.cursor).writePath(new Database.PathPart[]{
+            new Database.HashMapGet(new Database.HashMapGetKey(hash)),
+            new Database.Context(cursor -> cursor.writeIfEmpty(data)),
+        });
     }
 
     public WriteCursor putCursor(byte[] hash) throws Exception {

@@ -1,20 +1,25 @@
 package io.github.radarroark.xitdb;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -24,34 +29,42 @@ class HighLevelDatabaseTest {
 
     @Test
     void testHightLevelApi() throws Exception {
-        try (var core = new CoreMemory(new RandomAccessMemory())) {
-            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            testHighLevelApi(core, hasher, null);
-        }
-
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
-
-            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+        for (boolean legacy : new boolean[]{true, false}) {
+            try (var core = new CoreMemory(new RandomAccessMemory())) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testHighLevelApi(core, hasher, file);
+                testHighLevelApi(core, hasher, null, legacy);
             }
-        }
 
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
 
-            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testHighLevelApi(core, hasher, file);
+                try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testHighLevelApi(core, hasher, file, legacy);
+                }
+            }
+
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
+
+                try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testHighLevelApi(core, hasher, file, legacy);
+                }
             }
         }
     }
 
     @Test
     void notUsingArrayListAtTopLevel() throws Exception {
+        for (boolean legacy : new boolean[]{true, false}) {
+            testNotUsingArrayListAtTopLevel(legacy);
+        }
+    }
+
+    void testNotUsingArrayListAtTopLevel(boolean legacy) throws Exception {
         // normally an arraylist makes the most sense at the top level,
         // but this test just ensures we can use other data structures
         // at the top level. in theory a top-level hash map might make
@@ -62,34 +75,61 @@ class HighLevelDatabaseTest {
         // hash map
         try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            var db = new Database(core, hasher);
+            var db = initDb(core, hasher, legacy);
 
             var map = new WriteHashMap(db.rootCursor());
             map.put("foo", new Database.Bytes("foo"));
             map.put("bar", new Database.Bytes("bar"));
 
-            // init inner map
-            {
-                var innerMapCursor = map.putCursor("inner-map");
-                new WriteHashMap(innerMapCursor);
-            }
+            if (legacy) {
+                // init inner map
+                {
+                    var innerMapCursor = map.putCursor("inner-map");
+                    new WriteHashMap(innerMapCursor);
+                }
 
-            // re-init inner map
-            // since the top-level type isn't an arraylist, there is no concept of
-            // a transaction, so this does not perform a copy of the root node
-            {
+                // re-init inner map
+                // since the top-level type isn't an arraylist, there is no concept of
+                // a transaction, so this does not perform a copy of the root node
+                {
+                    var innerMapCursor = map.putCursor("inner-map");
+                    new WriteHashMap(innerMapCursor);
+                }
+            } else {
+                // in the newest version every write to the root is a transaction,
+                // so a nested cursor can't be written to after it was returned
                 var innerMapCursor = map.putCursor("inner-map");
-                new WriteHashMap(innerMapCursor);
+                assertThrows(IllegalStateException.class, () -> new WriteHashMap(innerMapCursor));
             }
         }
 
-        // linked array list is not currently allowed at the top level
+        // linked array list is only allowed at the top level in the newest version
         try (var core = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            var db = new Database(core, hasher);
+            var db = initDb(core, hasher, legacy);
 
-            assertThrows(Database.InvalidTopLevelTypeException.class, () -> new WriteLinkedArrayList(db.rootCursor()));
+            if (legacy) {
+                assertThrows(Database.InvalidTopLevelTypeException.class, () -> new WriteLinkedArrayList(db.rootCursor()));
+            } else {
+                var list = new WriteLinkedArrayList(db.rootCursor());
+                list.append(new Database.Uint(1));
+                assertEquals(1, list.count());
+            }
         }
+    }
+
+    // creates a database. if `legacy` is true and the storage is empty, it first
+    // writes a version 0 header, which is all an empty legacy database contains.
+    static Database initDb(Core core, Hasher hasher, boolean legacy) throws Exception {
+        if (legacy && core.length() == 0) {
+            var header = new Database.Header(hasher.id(), (short) hasher.md().getDigestLength(), (short) 0, Tag.NONE, Database.MAGIC_NUMBER);
+            core.seek(0);
+            header.write(core);
+            core.flush();
+        }
+        var db = new Database(core, hasher);
+        assertEquals(legacy ? 0 : Database.VERSION, db.header.version());
+        return db;
     }
 
     @Test
@@ -337,10 +377,10 @@ class HighLevelDatabaseTest {
         db.get().core.close();
     }
 
-    void testHighLevelApi(Core core, Hasher hasher, File fileMaybe) throws Exception {
+    void testHighLevelApi(Core core, Hasher hasher, File fileMaybe, boolean legacy) throws Exception {
         // init the db
         core.setLength(0);
-        var db = new Database(core, hasher);
+        var db = initDb(core, hasher, legacy);
 
         {
             // to get the benefits of immutability, the top-level data structure
@@ -754,7 +794,7 @@ class HighLevelDatabaseTest {
                 }
             }
 
-            db = new Database(core, hasher);
+            db = initDb(core, hasher, legacy);
 
             var sizeAfter = core.length();
 
@@ -980,71 +1020,110 @@ class HighLevelDatabaseTest {
 
     @Test
     void testCompaction() throws Exception {
-        // memory
-        try (var core = new CoreMemory(new RandomAccessMemory())) {
+        for (boolean legacy : new boolean[]{true, false}) {
+            // memory
+            try (var core = new CoreMemory(new RandomAccessMemory())) {
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                try (var targetCore = new CoreMemory(new RandomAccessMemory())) {
+                    testCompaction(core, targetCore, hasher, null, null, null, legacy);
+                }
+            }
+
+            // file
+            {
+                var sourceFile = File.createTempFile("compact_source", ".db");
+                sourceFile.deleteOnExit();
+                var targetFile = File.createTempFile("compact_target", ".db");
+                targetFile.deleteOnExit();
+
+                try (var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
+                     var targetCore = new CoreFile(new RandomAccessFile(targetFile, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, null, legacy);
+                }
+            }
+
+            // buffered file
+            {
+                var sourceFile = File.createTempFile("compact_source", ".db");
+                sourceFile.deleteOnExit();
+                var targetFile = File.createTempFile("compact_target", ".db");
+                targetFile.deleteOnExit();
+
+                try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
+                     var targetCore = new CoreBufferedFile(new RandomAccessBufferedFile(targetFile, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, null, legacy);
+                }
+            }
+
+            // buffered file to memory
+            {
+                var sourceFile = File.createTempFile("compact_source", ".db");
+                sourceFile.deleteOnExit();
+
+                try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
+                     var targetCore = new CoreMemory(new RandomAccessMemory())) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testCompaction(sourceCore, targetCore, hasher, sourceFile, null, null, legacy);
+                }
+            }
+        }
+
+        // compacting migrates a legacy database to the newest version
+        try (var sourceCore = new CoreMemory(new RandomAccessMemory());
+             var targetCore = new CoreMemory(new RandomAccessMemory())) {
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            try (var targetCore = new CoreMemory(new RandomAccessMemory())) {
-                testCompaction(core, targetCore, hasher, null, null, null);
-            }
-        }
 
-        // file
-        {
-            var sourceFile = File.createTempFile("compact_source", ".db");
-            sourceFile.deleteOnExit();
-            var targetFile = File.createTempFile("compact_target", ".db");
-            targetFile.deleteOnExit();
+            var source = initDb(sourceCore, hasher, true);
+            assertEquals(0, source.header.version());
+            var history = new WriteArrayList(source.rootCursor());
+            history.append(new Database.Uint(1));
+            history.append(new Database.Uint(2));
 
-            try (var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
-                 var targetCore = new CoreFile(new RandomAccessFile(targetFile, "rw"))) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, null);
-            }
-        }
+            var target = source.compact(targetCore);
+            assertTrue(target.header.streaming());
+            assertEquals(Database.VERSION, target.header.version());
+            var targetHistory = new ReadArrayList(target.rootCursor());
+            assertEquals(1, targetHistory.count());
+            assertEquals(2, targetHistory.getCursor(-1).readUint());
 
-        // buffered file
-        {
-            var sourceFile = File.createTempFile("compact_source", ".db");
-            sourceFile.deleteOnExit();
-            var targetFile = File.createTempFile("compact_target", ".db");
-            targetFile.deleteOnExit();
-
-            try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
-                 var targetCore = new CoreBufferedFile(new RandomAccessBufferedFile(targetFile, "rw"))) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, null);
-            }
-        }
-
-        // buffered file to memory
-        {
-            var sourceFile = File.createTempFile("compact_source", ".db");
-            sourceFile.deleteOnExit();
-
-            try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
-                 var targetCore = new CoreMemory(new RandomAccessMemory())) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testCompaction(sourceCore, targetCore, hasher, sourceFile, null, null);
+            // and compacting a database in the newest version keeps it there
+            try (var compactedCore = new CoreMemory(new RandomAccessMemory())) {
+                var compacted = target.compact(compactedCore);
+                assertEquals(Database.VERSION, compacted.header.version());
             }
         }
     }
 
     @Test
     void testCompactionWithDiskBackedOffsetsMap(@TempDir Path tempDir) throws Exception {
+        // a custom offsets map only needs reset, get, and put. FileOffsetMap stores
+        // offsets directly as hashes in a separate xitdb hash map, inside one
+        // transaction that lasts for the whole compaction, so each put isn't
+        // committed separately.
         var offsetsFile = tempDir.resolve("compact_offsets.db").toFile();
         var sourceFile = tempDir.resolve("compact_source.db").toFile();
         var targetFile = tempDir.resolve("compact_target.db").toFile();
 
-        try (var offsetMap = new FileOffsetMap(new RandomAccessFile(offsetsFile, "rw"));
+        try (var offsetsCore = new CoreFile(new RandomAccessFile(offsetsFile, "rw"));
              var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
              var targetCore = new CoreFile(new RandomAccessFile(targetFile, "rw"))) {
-            // reusing a scratch map must discard offsets from previous compactions
-            offsetMap.put(0, 123);
-
-            // reuse the existing data type, cycle, sharing, and reopening checks
+            var offsetsDb = new Database(offsetsCore, new Hasher(MessageDigest.getInstance("SHA-256")));
             var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, offsetMap);
-            assertNull(offsetMap.get(0));
+
+            offsetsDb.runContext(cursor -> {
+                var offsetMap = new FileOffsetMap(new WriteHashMap(cursor));
+
+                // exercise the same data types, cycles, sharing, and reopening checks
+                // as the in-memory offsets map, reusing the scratch map between runs.
+                // reusing it must discard offsets from previous compactions.
+                for (boolean legacy : new boolean[]{true, false}) {
+                    offsetMap.put(0, 123);
+                    testCompaction(sourceCore, targetCore, hasher, sourceFile, targetFile, offsetMap, legacy);
+                    assertNull(offsetMap.get(0));
+                }
+            });
         }
     }
 
@@ -1052,12 +1131,12 @@ class HighLevelDatabaseTest {
         return offsetMap == null ? source.compact(targetCore) : source.compact(targetCore, offsetMap);
     }
 
-    void testCompaction(Core sourceCore, Core targetCore, Hasher hasher, File sourceFile, File targetFile, OffsetMap offsetMap) throws Exception {
+    void testCompaction(Core sourceCore, Core targetCore, Hasher hasher, File sourceFile, File targetFile, OffsetMap offsetMap, boolean legacy) throws Exception {
         // empty DB compaction
         {
             sourceCore.setLength(0);
             targetCore.setLength(0);
-            var source = new Database(sourceCore, hasher);
+            var source = initDb(sourceCore, hasher, legacy);
             var compacted = compact(source, targetCore, offsetMap);
             assertEquals(Tag.NONE, compacted.header.tag());
         }
@@ -1066,7 +1145,7 @@ class HighLevelDatabaseTest {
         {
             sourceCore.setLength(0);
             targetCore.setLength(0);
-            var source = new Database(sourceCore, hasher);
+            var source = initDb(sourceCore, hasher, legacy);
 
             // moment 1
             {
@@ -1268,7 +1347,7 @@ class HighLevelDatabaseTest {
         {
             sourceCore.setLength(0);
             targetCore.setLength(0);
-            var source = new Database(sourceCore, hasher);
+            var source = initDb(sourceCore, hasher, legacy);
 
             // moment 1: create many keys
             {
@@ -1315,7 +1394,7 @@ class HighLevelDatabaseTest {
             {
                 sourceCore.setLength(0);
                 targetCore.setLength(0);
-                var source = new Database(sourceCore, hasher);
+                var source = initDb(sourceCore, hasher, legacy);
 
                 // write some data
                 {
@@ -1347,7 +1426,7 @@ class HighLevelDatabaseTest {
             {
                 sourceCore.setLength(0);
                 targetCore.setLength(0);
-                var source = new Database(sourceCore, hasher);
+                var source = initDb(sourceCore, hasher, legacy);
 
                 // write initial data
                 {
@@ -1392,32 +1471,34 @@ class HighLevelDatabaseTest {
 
     @Test
     void testSortedMap() throws Exception {
-        try (var core = new CoreMemory(new RandomAccessMemory())) {
-            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            testSortedMap(core, hasher);
-        }
-
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
-            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+        for (boolean legacy : new boolean[]{true, false}) {
+            try (var core = new CoreMemory(new RandomAccessMemory())) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testSortedMap(core, hasher);
+                testSortedMap(core, hasher, legacy);
             }
-        }
 
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
-            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testSortedMap(core, hasher);
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
+                try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testSortedMap(core, hasher, legacy);
+                }
+            }
+
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
+                try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testSortedMap(core, hasher, legacy);
+                }
             }
         }
     }
 
-    void testSortedMap(Core core, Hasher hasher) throws Exception {
-        var db = new Database(core, hasher);
+    void testSortedMap(Core core, Hasher hasher, boolean legacy) throws Exception {
+        var db = initDb(core, hasher, legacy);
         var rootCursor = db.rootCursor();
 
         // keys "k0000".."k0059" sort lexicographically in numeric order
@@ -1591,6 +1672,12 @@ class HighLevelDatabaseTest {
             var map = new ReadSortedMap(moment.getCursor("map"));
             assertEquals(COUNT / 2, map.count());
             assertEquals("k0001", new String(map.getIndexKeyValuePair(0).keyCursor.readBytes(MAX_READ_BYTES)));
+
+            // entries have no hash, except in version 0 databases
+            var entry = map.cursor.readPathSlot(new Database.PathPart[]{
+                new Database.SortedMapGet(new Database.SortedMapGetKVPair("k0001".getBytes()))
+            });
+            assertEquals(legacy ? Tag.KV_PAIR : Tag.SORTED_KV_PAIR, entry.tag());
         }
 
         // a second moment that inherits and mutates the map must not disturb the first
@@ -1626,32 +1713,34 @@ class HighLevelDatabaseTest {
 
     @Test
     void testIteratorFrom() throws Exception {
-        try (var core = new CoreMemory(new RandomAccessMemory())) {
-            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-            testIteratorFrom(core, hasher);
-        }
-
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
-            try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+        for (boolean legacy : new boolean[]{true, false}) {
+            try (var core = new CoreMemory(new RandomAccessMemory())) {
                 var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testIteratorFrom(core, hasher);
+                testIteratorFrom(core, hasher, legacy);
             }
-        }
 
-        {
-            var file = File.createTempFile("database", "");
-            file.deleteOnExit();
-            try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
-                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
-                testIteratorFrom(core, hasher);
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
+                try (var core = new CoreFile(new RandomAccessFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testIteratorFrom(core, hasher, legacy);
+                }
+            }
+
+            {
+                var file = File.createTempFile("database", "");
+                file.deleteOnExit();
+                try (var core = new CoreBufferedFile(new RandomAccessBufferedFile(file, "rw"))) {
+                    var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                    testIteratorFrom(core, hasher, legacy);
+                }
             }
         }
     }
 
-    void testIteratorFrom(Core core, Hasher hasher) throws Exception {
-        var db = new Database(core, hasher);
+    void testIteratorFrom(Core core, Hasher hasher, boolean legacy) throws Exception {
+        var db = initDb(core, hasher, legacy);
         var rootCursor = db.rootCursor();
 
         // enough items to force several tiers in both the array-list radix trie
@@ -1737,6 +1826,568 @@ class HighLevelDatabaseTest {
         for (long start : outOfRange) {
             assertTrue(!list.iteratorFrom(start).hasNext());
             assertTrue(!linked.iteratorFrom(start).hasNext());
+        }
+    }
+
+    @Test
+    void testStreaming() throws Exception {
+        try (var sourceCore = new CoreMemory(new RandomAccessMemory());
+             var replicaCore = new CoreMemory(new RandomAccessMemory())) {
+            var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+            testStreaming(sourceCore, replicaCore, hasher);
+            testStreamingRoots(sourceCore, replicaCore, hasher);
+        }
+
+        {
+            var sourceFile = File.createTempFile("database", "");
+            sourceFile.deleteOnExit();
+            var replicaFile = File.createTempFile("replica", "");
+            replicaFile.deleteOnExit();
+
+            try (var sourceCore = new CoreFile(new RandomAccessFile(sourceFile, "rw"));
+                 var replicaCore = new CoreFile(new RandomAccessFile(replicaFile, "rw"))) {
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testStreaming(sourceCore, replicaCore, hasher);
+                testStreamingRoots(sourceCore, replicaCore, hasher);
+            }
+        }
+
+        {
+            var sourceFile = File.createTempFile("database", "");
+            sourceFile.deleteOnExit();
+            var replicaFile = File.createTempFile("replica", "");
+            replicaFile.deleteOnExit();
+
+            try (var sourceCore = new CoreBufferedFile(new RandomAccessBufferedFile(sourceFile, "rw"));
+                 var replicaCore = new CoreBufferedFile(new RandomAccessBufferedFile(replicaFile, "rw"))) {
+                var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+                testStreaming(sourceCore, replicaCore, hasher);
+                testStreamingRoots(sourceCore, replicaCore, hasher);
+            }
+        }
+
+        testReplicaOfOtherFile();
+    }
+
+    // a replica is never extended with bytes from a file it isn't a replica of
+    void testReplicaOfOtherFile() throws Exception {
+        var hasher = new Hasher(MessageDigest.getInstance("SHA-1"));
+        try (var sourceCore = new CoreMemory(new RandomAccessMemory());
+             var otherCore = new CoreMemory(new RandomAccessMemory());
+             var restoredCore = new CoreMemory(new RandomAccessMemory());
+             var replicaCore = new CoreMemory(new RandomAccessMemory())) {
+            var source = new Database(sourceCore, hasher, 1L);
+            var other = new Database(otherCore, hasher, 2L);
+            var replica = new Database(replicaCore, hasher);
+
+            // the same writes give both files the same layout
+            var sourceRoot = source.rootCursor();
+            sourceRoot.write(new Database.Uint(1));
+            var otherRoot = other.rootCursor();
+            otherRoot.write(new Database.Uint(1));
+            replicate(source, replica);
+
+            // the other file has a trailer where the replica's committed bytes end,
+            // but its checksum covers a different file ID, so the replica is replaced
+            otherRoot.write(new Database.Uint(2));
+            assertEquals(0, other.replicationStart(replica.replicaState()));
+
+            // and if its bytes are appended anyway, they are rejected
+            {
+                var start = replica.committedSize();
+                var end = other.committedSize();
+                var buffer = new ByteArrayOutputStream();
+                other.readCommitted(start, end, buffer);
+                var reader = new ByteArrayInputStream(buffer.toByteArray());
+                assertThrows(Database.InvalidDatabaseException.class, () -> replica.applyReplicated(start, reader, end - start));
+                assertEquals(start, replica.committedSize());
+            }
+
+            // a source restored from an older copy keeps its file ID, but
+            // its history diverges, so the replica is replaced too
+            var restored = new Database(restoredCore, hasher, 1L);
+            var restoredRoot = restored.rootCursor();
+            restoredRoot.write(new Database.Uint(3));
+            assertEquals(0, restored.replicationStart(replica.replicaState()));
+
+            // copies of one file that write different data of the same size have the
+            // same layout, but every commit has a random ID, so their histories differ
+            try (var copyACore = new CoreMemory(new RandomAccessMemory());
+                 var copyBCore = new CoreMemory(new RandomAccessMemory());
+                 var copyReplicaCore = new CoreMemory(new RandomAccessMemory())) {
+                var copyA = new Database(copyACore, hasher, 3L);
+                var copyB = new Database(copyBCore, hasher, 3L);
+                var copyReplica = new Database(copyReplicaCore, hasher);
+                copyA.rootCursor().write(new Database.Bytes("aaaaaaaaaaaa"));
+                copyB.rootCursor().write(new Database.Bytes("bbbbbbbbbbbb"));
+
+                replicate(copyA, copyReplica);
+                assertEquals(copyA.committedSize(), copyB.committedSize());
+                assertEquals(0, copyB.replicationStart(copyReplica.replicaState()));
+                replicate(copyB, copyReplica);
+                assertEquals("bbbbbbbbbbbb", new String(copyReplica.rootCursor().readBytes(MAX_READ_BYTES)));
+            }
+
+            // while the real source only sends the new bytes
+            sourceRoot.write(new Database.Uint(2));
+            assertEquals(replica.committedSize(), source.replicationStart(replica.replicaState()));
+            replicate(source, replica);
+            expectSameCommittedBytes(source, replica);
+        }
+    }
+
+    static byte[] readCommittedBytes(Database db, long start) throws Exception {
+        var buffer = new ByteArrayOutputStream();
+        db.readCommitted(start, db.committedSize(), buffer);
+        return buffer.toByteArray();
+    }
+
+    // the replica sends its state, and the source sends back the bytes it doesn't
+    // have yet (or all of them, if it isn't a replica of this source)
+    static void replicate(Database source, Database replica) throws Exception {
+        var start = source.replicationStart(replica.replicaState());
+        var end = source.committedSize();
+        var buffer = new ByteArrayOutputStream();
+        source.readCommitted(start, end, buffer);
+        var reader = new ByteArrayInputStream(buffer.toByteArray());
+        replica.applyReplicated(start, reader, end - start);
+    }
+
+    // checks that no committed byte has changed since `committed` was read,
+    // except the root header (the root slot and file size after the database
+    // header and file ID). then replicates and checks that the replica is identical.
+    // returns the bytes that are committed now.
+    static byte[] expectAppendOnlyAndReplicate(Database source, Database replica, byte[] committed) throws Exception {
+        var rootHeaderStart = Database.Header.length + 8;
+        var rootHeaderEnd = rootHeaderStart + 17;
+        var current = readCommittedBytes(source, 0);
+        assertTrue(current.length >= committed.length);
+        assertArrayEquals(Arrays.copyOfRange(committed, 0, rootHeaderStart), Arrays.copyOfRange(current, 0, rootHeaderStart));
+        assertArrayEquals(Arrays.copyOfRange(committed, rootHeaderEnd, committed.length), Arrays.copyOfRange(current, rootHeaderEnd, committed.length));
+
+        replicate(source, replica);
+        var replicaBytes = readCommittedBytes(replica, 0);
+        assertArrayEquals(current, replicaBytes);
+        return current;
+    }
+
+    static void expectSameCommittedBytes(Database source, Database replica) throws Exception {
+        var sourceBytes = readCommittedBytes(source, 0);
+        var replicaBytes = readCommittedBytes(replica, 0);
+        assertArrayEquals(sourceBytes, replicaBytes);
+    }
+
+    static class FailException extends Exception {}
+
+    // writes moment i: a key, and an item appended to a list. if fail is true, it then throws.
+    static Database.ContextFunction momentContext(long i, boolean fail) {
+        return (cursor) -> {
+            var moment = new WriteHashMap(cursor);
+            moment.put("key-" + i, new Database.Uint(i));
+            var list = new WriteArrayList(moment.putCursor("list"));
+            list.append(new Database.Uint(i));
+            if (fail) throw new FailException();
+        };
+    }
+
+    void testStreaming(Core sourceCore, Core replicaCore, Hasher hasher) throws Exception {
+        sourceCore.setLength(0);
+        replicaCore.setLength(0);
+
+        // a fixed file ID, so the bytes of the new database are known
+        var source = new Database(sourceCore, hasher, 0x0102030405060708L);
+        var replica = new Database(replicaCore, hasher);
+
+        // a new streaming database is its header, its file ID, its root header, and
+        // the trailer for its empty root: the slot (9 zero bytes), the commit ID (0 for
+        // the first commit), then the CRC-64/XZ of the file ID, the trailer's position
+        // (37), the slot, and the commit ID
+        {
+            var bytes = readCommittedBytes(source, 0);
+            assertEquals(62, bytes.length);
+            assertArrayEquals(new byte[]{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, Arrays.copyOfRange(bytes, 12, 20));
+            assertArrayEquals(new byte[]{
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, (byte) 0xd6, 0x18, 0x4e, 0x46, (byte) 0xb4, 0x7d, 0x29,
+                0x26,
+            }, Arrays.copyOfRange(bytes, 37, bytes.length));
+        }
+
+        // new databases have their own random file IDs, so the
+        // first sync replaces the replica with a copy of the source
+        assertEquals(0, source.replicationStart(replica.replicaState()));
+        replicate(source, replica);
+        expectSameCommittedBytes(source, replica);
+
+        // older builds can't open streaming databases
+        assertEquals(1, source.header.version());
+
+        // the root slot carries the type of the top-level data
+        assertEquals(Tag.NONE, source.header.tag());
+
+        var history = new WriteArrayList(source.rootCursor());
+
+        var committed = readCommittedBytes(source, 0);
+
+        // enough moments for the top-level array list to grow to three levels
+        for (int i = 0; i < 300; i++) {
+            if (i == 200) {
+                // roll back the history
+                history.slice(150);
+            } else if (i % 50 == 25) {
+                // a failed transaction
+                final int n = i;
+                assertThrows(FailException.class, () -> history.appendContext(history.getSlot(-1), momentContext(n, true)));
+            } else {
+                history.appendContext(history.getSlot(-1), momentContext(i, false));
+            }
+
+            committed = expectAppendOnlyAndReplicate(source, replica, committed);
+        }
+
+        // applyReplicated must be given exactly the bytes up to a trailer.
+        // a short append fails and is overwritten by the next one.
+        {
+            history.appendContext(history.getSlot(-1), momentContext(300, false));
+            var start = replica.committedSize();
+            var end = source.committedSize();
+            var bytes = readCommittedBytes(source, start);
+            var shortReader = new ByteArrayInputStream(bytes, 0, bytes.length - 1);
+            assertThrows(Database.InvalidDatabaseException.class, () -> replica.applyReplicated(start, shortReader, bytes.length - 1));
+            assertEquals(start, replica.committedSize());
+            // and only committed bytes can be read, starting at 0 or after the root header
+            var discarding = OutputStream.nullOutputStream();
+            assertThrows(Database.InvalidRangeException.class, () -> source.readCommitted(start, end + 1, discarding));
+            assertThrows(Database.InvalidRangeException.class, () -> source.readCommitted(20, end, discarding));
+            replicate(source, replica);
+            expectSameCommittedBytes(source, replica);
+        }
+
+        // openCommitted and openReplicated stream the same bytes in pieces.
+        // a stream from 0 substitutes the root header, so read across it too.
+        {
+            history.appendContext(history.getSlot(-1), momentContext(301, false));
+            var start = replica.committedSize();
+            var end = source.committedSize();
+            for (var from : new long[] {0, start}) {
+                var expected = new ByteArrayOutputStream();
+                source.readCommitted(from, end, expected);
+                var actual = new ByteArrayOutputStream();
+                try (var reader = source.openCommitted(from, end)) {
+                    var buffer = new byte[7];
+                    int n;
+                    while ((n = reader.read(buffer, 0, buffer.length)) != -1) actual.write(buffer, 0, n);
+                }
+                assertArrayEquals(expected.toByteArray(), actual.toByteArray());
+            }
+
+            var bytes = readCommittedBytes(source, start);
+            // closing the stream early leaves the replica at its last commit
+            var early = replica.openReplicated(start, bytes.length);
+            early.write(bytes, 0, 10);
+            assertThrows(Database.EndOfStreamException.class, early::close);
+            assertEquals(start, replica.committedSize());
+            // and it can't take more bytes than it was asked for
+            try (var writer = replica.openReplicated(start, bytes.length)) {
+                for (var i = 0; i < bytes.length; i += 7) writer.write(bytes, i, Math.min(7, bytes.length - i));
+                assertThrows(Database.InvalidRangeException.class, () -> writer.write(0));
+            }
+            expectSameCommittedBytes(source, replica);
+        }
+
+        // the replica can be reopened and read
+        var reopenedReplica = new Database(replicaCore, hasher);
+        var sourceHistory = new ReadArrayList(source.rootCursor());
+        var replicaHistory = new ReadArrayList(reopenedReplica.rootCursor());
+        assertEquals(sourceHistory.count(), replicaHistory.count());
+        var moment = new ReadHashMap(replicaHistory.getCursor(-1));
+        assertEquals(299, moment.getCursor("key-299").readUint());
+        // removed by the slice
+        assertNull(moment.getCursor("key-180"));
+        assertEquals(149, moment.getCursor("key-149").readUint());
+
+        // a compacted database is a new file, so a replica of it is seeded from byte 0
+        try (var targetCore = new CoreMemory(new RandomAccessMemory());
+             var compactedReplicaCore = new CoreMemory(new RandomAccessMemory())) {
+            var target = source.compact(targetCore);
+            var compactedReplica = new Database(compactedReplicaCore, hasher);
+            replicate(target, compactedReplica);
+            expectSameCommittedBytes(target, compactedReplica);
+
+            // and it can keep receiving transactions
+            var targetHistory = new WriteArrayList(target.rootCursor());
+            targetHistory.append(targetHistory.getSlot(-1));
+            replicate(target, compactedReplica);
+            expectSameCommittedBytes(target, compactedReplica);
+
+            var compactedHistory = new ReadArrayList(compactedReplica.rootCursor());
+            assertEquals(2, compactedHistory.count());
+            var compactedMoment = new ReadHashMap(compactedHistory.getCursor(-1));
+            assertEquals(299, compactedMoment.getCursor("key-299").readUint());
+        }
+
+        // a database whose trailer doesn't match its header is invalid
+        {
+            var pos = reopenedReplica.committedSize() - 1;
+            reopenedReplica.core.seek(pos);
+            var b = reopenedReplica.core.reader().readByte();
+            reopenedReplica.core.seek(pos);
+            reopenedReplica.core.writer().writeByte(~b);
+            reopenedReplica.core.flush();
+            assertThrows(Database.InvalidDatabaseException.class, () -> new Database(replicaCore, hasher));
+        }
+    }
+
+    // in streaming mode, the root can be any type, not just an array list
+    void testStreamingRoots(Core sourceCore, Core replicaCore, Hasher hasher) throws Exception {
+        // a hash map root
+        {
+            sourceCore.setLength(0);
+            replicaCore.setLength(0);
+
+            var source = new Database(sourceCore, hasher);
+            var replica = new Database(replicaCore, hasher);
+
+            var map = new WriteHashMap(source.rootCursor());
+
+            // initializing an initialized root doesn't start a transaction
+            var sizeAfterInit = source.committedSize();
+            new WriteHashMap(source.rootCursor());
+            assertEquals(sizeAfterInit, source.committedSize());
+
+            // nor can the root be initialized as another type
+            assertThrows(Database.UnexpectedTagException.class, () -> new WriteArrayList(source.rootCursor()));
+            assertEquals(sizeAfterInit, source.committedSize());
+
+            var committed = readCommittedBytes(source, 0);
+
+            for (int i = 0; i < 100; i++) {
+                map.put("key-" + i, new Database.Uint(i));
+                if (i == 50) {
+                    assertTrue(map.remove("key-25"));
+                }
+
+                committed = expectAppendOnlyAndReplicate(source, replica, committed);
+            }
+
+            // a key is written in the same transaction as the lookup, so it works on a root map.
+            // (the string-key puts above already wrote their keys, so use an entry without one.)
+            map.put(source.hash("key-only-hashed".getBytes()), new Database.Uint(1));
+            map.putKey("key-only-hashed", new Database.Bytes("key-only-hashed"));
+            {
+                var kv = map.getKeyValuePair("key-only-hashed");
+                assertEquals("key-only-hashed", new String(kv.keyCursor.readBytes(MAX_READ_BYTES)));
+                assertEquals(1, kv.valueCursor.readUint());
+            }
+
+            // nested collections are written inside one transaction
+            ((WriteCursor) map.cursor).writePath(new Database.PathPart[]{
+                new Database.HashMapGet(new Database.HashMapGetValue(source.hash("inner".getBytes()))),
+                new Database.Context((cursor) -> {
+                    var inner = new WriteHashMap(cursor);
+                    inner.put("foo", new Database.Bytes("foo"));
+                    var list = new WriteArrayList(inner.putCursor("list"));
+                    list.append(new Database.Uint(1));
+                    list.append(new Database.Uint(2));
+                })
+            });
+            replicate(source, replica);
+            expectSameCommittedBytes(source, replica);
+
+            // runContext groups many writes into one transaction
+            {
+                var sizeBefore = source.committedSize();
+                Database.ContextFunction batch = (cursor) -> {
+                    var root = new WriteHashMap(cursor);
+                    for (int i = 0; i < 100; i++) {
+                        root.put("batch-" + i, new Database.Uint(i));
+                    }
+                };
+
+                // a failed transaction leaves nothing behind
+                assertThrows(FailException.class, () -> source.runContext((cursor) -> {
+                    batch.run(cursor);
+                    throw new FailException();
+                }));
+                assertEquals(sizeBefore, source.committedSize());
+                assertNull(map.getCursor("batch-0"));
+
+                // a successful one commits everything at once
+                source.runContext(batch);
+                assertTrue(source.committedSize() > sizeBefore);
+                assertEquals(0, map.getCursor("batch-0").readUint());
+                assertEquals(99, map.getCursor("batch-99").readUint());
+                replicate(source, replica);
+                expectSameCommittedBytes(source, replica);
+            }
+
+            // a nested write cursor can't be written to after its transaction
+            var lateCursor = map.putCursor("late");
+            assertThrows(IllegalStateException.class, () -> lateCursor.write(new Database.Uint(1)));
+            assertThrows(IllegalStateException.class, () -> new WriteHashMap(lateCursor));
+            replicate(source, replica);
+            expectSameCommittedBytes(source, replica);
+
+            // the replica can be reopened and read
+            replica = new Database(replicaCore, hasher);
+            {
+                var replicaMap = new ReadHashMap(replica.rootCursor());
+                assertEquals(99, replicaMap.getCursor("key-99").readUint());
+                assertNull(replicaMap.getCursor("key-25"));
+                var inner = new ReadHashMap(replicaMap.getCursor("inner"));
+                var list = new ReadArrayList(inner.getCursor("list"));
+                assertEquals(2, list.count());
+                assertEquals(2, list.getCursor(-1).readUint());
+            }
+
+            // it can be compacted
+            try (var targetCore = new CoreMemory(new RandomAccessMemory());
+                 var compactedReplicaCore = new CoreMemory(new RandomAccessMemory())) {
+                var target = replica.compact(targetCore);
+                assertTrue(target.header.streaming());
+                assertTrue(target.committedSize() < replica.committedSize());
+
+                var targetMap = new ReadHashMap(target.rootCursor());
+                assertEquals(99, targetMap.getCursor("key-99").readUint());
+                assertNull(targetMap.getCursor("key-25"));
+                var inner = new ReadHashMap(targetMap.getCursor("inner"));
+                var list = new ReadArrayList(inner.getCursor("list"));
+                assertEquals(2, list.count());
+
+                // a compacted database is a new file, so a replica of it is seeded from byte 0
+                var compactedReplica = new Database(compactedReplicaCore, hasher);
+                replicate(target, compactedReplica);
+                expectSameCommittedBytes(target, compactedReplica);
+            }
+        }
+
+        // an array list root held by a wrapper stays current
+        {
+            sourceCore.setLength(0);
+            var db = new Database(sourceCore, hasher);
+
+            var history = new WriteArrayList(db.rootCursor());
+            history.append(new Database.Uint(1));
+            history.append(new Database.Uint(2));
+            assertEquals(2, history.count());
+            var iter = history.iterator();
+            int iterCount = 0;
+            while (iter.hasNext()) {
+                iter.next();
+                iterCount += 1;
+            }
+            assertEquals(2, iterCount);
+
+            // initializing an initialized root doesn't start a transaction
+            var size = db.committedSize();
+            new WriteArrayList(db.rootCursor());
+            assertEquals(size, db.committedSize());
+        }
+
+        // a scalar root
+        {
+            sourceCore.setLength(0);
+            var db = new Database(sourceCore, hasher);
+
+            var retained = db.rootCursor();
+            var root = db.rootCursor();
+            root.write(new Database.Uint(42));
+            assertEquals(42, root.readUint());
+            assertEquals(42, db.rootCursor().readUint());
+
+            // a root cursor kept from before the write sees the new root
+            // everywhere it reads its slot, not just in typed reads
+            assertEquals(42, retained.readUint());
+            assertEquals(42, retained.slot().value());
+            assertEquals(42, retained.readPathSlot(new Database.PathPart[0]).value());
+            assertEquals(42, retained.readPath(new Database.PathPart[0]).readUint());
+
+            // the cursor stays a root cursor, so it can keep writing
+            root.write(new Database.Bytes("this is too long to fit in a slot"));
+            assertEquals("this is too long to fit in a slot", new String(db.rootCursor().readBytes(MAX_READ_BYTES)));
+
+            // bytes can't be streamed into the root
+            assertThrows(Database.CursorNotWriteableException.class, () -> root.writer());
+
+            // a scalar root can't be initialized as a collection
+            assertThrows(Database.UnexpectedTagException.class, () -> new WriteHashMap(db.rootCursor()));
+
+            // but once it is cleared, it can
+            root.write(null);
+            var map = new WriteHashMap(db.rootCursor());
+            map.put("foo", new Database.Uint(1));
+            assertEquals(1, map.getCursor("foo").readUint());
+        }
+
+        // a hash set root
+        {
+            sourceCore.setLength(0);
+            var db = new Database(sourceCore, hasher);
+
+            var set = new WriteHashSet(db.rootCursor());
+            set.put("a");
+            set.put("a");
+            set.put("b");
+            assertEquals("a", new String(set.getCursor("a").readBytes(MAX_READ_BYTES)));
+            assertEquals("b", new String(set.getCursor("b").readBytes(MAX_READ_BYTES)));
+        }
+
+        // a sorted map root
+        {
+            sourceCore.setLength(0);
+            var db = new Database(sourceCore, hasher);
+
+            var map = new WriteSortedMap(db.rootCursor());
+            map.put("b", new Database.Uint(2));
+            map.put("a", new Database.Uint(1));
+            map.put("c", new Database.Uint(3));
+            assertTrue(map.remove("c"));
+            assertEquals(2, map.count());
+            assertEquals(1, map.rank("b"));
+            assertEquals(1, map.getCursor("a").readUint());
+
+            var size = db.committedSize();
+            new WriteSortedMap(db.rootCursor());
+            assertEquals(size, db.committedSize());
+        }
+
+        // a linked array list root
+        {
+            sourceCore.setLength(0);
+            var db = new Database(sourceCore, hasher);
+
+            var list = new WriteLinkedArrayList(db.rootCursor());
+            list.append(new Database.Uint(1));
+            list.append(new Database.Uint(3));
+            list.insert(1, new Database.Uint(2));
+            assertEquals(3, list.count());
+            assertEquals(2, list.getCursor(1).readUint());
+            list.remove(0);
+            assertEquals(2, list.getCursor(0).readUint());
+
+            var size = db.committedSize();
+            new WriteLinkedArrayList(db.rootCursor());
+            assertEquals(size, db.committedSize());
+        }
+
+        // a legacy database whose root is a hash map can be compacted into a streaming one
+        {
+            sourceCore.setLength(0);
+            var db = initDb(sourceCore, hasher, true);
+            assertTrue(!db.header.streaming());
+
+            var map = new WriteCountedHashMap(db.rootCursor());
+            map.put("foo", new Database.Uint(1));
+            map.put("bar", new Database.Uint(2));
+
+            try (var targetCore = new CoreMemory(new RandomAccessMemory())) {
+                var target = db.compact(targetCore);
+                assertTrue(target.header.streaming());
+                var targetMap = new ReadCountedHashMap(target.rootCursor());
+                assertEquals(2, targetMap.count());
+                assertEquals(2, targetMap.getCursor("bar").readUint());
+            }
         }
     }
 }

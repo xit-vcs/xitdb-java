@@ -16,7 +16,8 @@ public enum Tag {
     COUNTED_HASH_MAP,
     COUNTED_HASH_SET,
     SORTED_MAP,
-    SORTED_SET;
+    SORTED_SET,
+    SORTED_KV_PAIR;
 
     public static Tag valueOf(int n) {
         // validate the tag so corrupted data yields an error

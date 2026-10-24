@@ -1,6 +1,7 @@
 package io.github.radarroark.xitdb;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Stack;
@@ -14,15 +15,43 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         this.db = db;
     }
 
+    // for a streaming root cursor, this reads the root again (see resolved).
+    // Slotted.slot can't throw checked exceptions, so a failed read is unchecked.
     @Override
     public Slot slot() {
-        return this.slotPtr.slot();
+        try {
+            return resolved().slot();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    // a streaming root cursor only has a snapshot of the root slot,
+    // which goes stale after the next transaction, so read it again.
+    // the result points at the copy of the root slot in the newest
+    // trailer, not the root header, so it is a fixed snapshot: the
+    // trailer never changes, so everything read through it comes from
+    // one commit, even if more are made.
+    // every method that reads slotPtr must go through this.
+    SlotPointer resolved() throws IOException {
+        if (this.db.header.streaming() && this.db.isRoot(this.slotPtr)) {
+            var header = this.db.readRootHeader();
+            if (header.fileSize() < Database.RootTrailer.length) throw new Database.InvalidDatabaseException();
+            // the root slot is the first thing in the trailer
+            return new SlotPointer(header.fileSize() - Database.RootTrailer.length, header.root());
+        }
+        return this.slotPtr;
+    }
+
+    ReadCursor resolvedCursor() throws IOException {
+        var slotPtr = resolved();
+        return slotPtr == this.slotPtr ? this : new ReadCursor(slotPtr, this.db);
     }
 
     // returns null for a missing value; explicitly stored none values have a cursor
     public ReadCursor readPath(Database.PathPart[] path) throws Exception {
         try {
-            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, this.slotPtr);
+            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, resolved());
             return new ReadCursor(slotPtr, this.db);
         } catch (Database.KeyNotFoundException e) {
             return null;
@@ -32,7 +61,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     // returns null for a missing value; explicitly stored none values have a full slot
     public Slot readPathSlot(Database.PathPart[] path) throws Exception {
         try {
-            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, this.slotPtr);
+            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, resolved());
             if (!slotPtr.slot().empty()) {
                 return slotPtr.slot();
             } else {
@@ -43,27 +72,30 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         }
     }
 
-    public long readUint() {
-        if (this.slotPtr.slot().tag() != Tag.UINT) {
+    public long readUint() throws IOException {
+        var slotPtr = resolved();
+        if (slotPtr.slot().tag() != Tag.UINT) {
             throw new Database.UnexpectedTagException();
         }
-        if (this.slotPtr.slot().value() < 0) throw new Database.ExpectedUnsignedLongException();
-        return this.slotPtr.slot().value();
+        if (slotPtr.slot().value() < 0) throw new Database.ExpectedUnsignedLongException();
+        return slotPtr.slot().value();
     }
 
-    public long readInt() {
-        if (this.slotPtr.slot().tag() != Tag.INT) {
+    public long readInt() throws IOException {
+        var slotPtr = resolved();
+        if (slotPtr.slot().tag() != Tag.INT) {
             throw new Database.UnexpectedTagException();
         }
-        return this.slotPtr.slot().value();
+        return slotPtr.slot().value();
     }
 
-    public double readFloat() {
-        if (this.slotPtr.slot().tag() != Tag.FLOAT) {
+    public double readFloat() throws IOException {
+        var slotPtr = resolved();
+        if (slotPtr.slot().tag() != Tag.FLOAT) {
             throw new Database.UnexpectedTagException();
         }
         var buffer = ByteBuffer.allocate(8);
-        buffer.putLong(this.slotPtr.slot().value());
+        buffer.putLong(slotPtr.slot().value());
         buffer.position(0);
         return buffer.getDouble();
     }
@@ -73,14 +105,15 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     }
 
     public Database.Bytes readBytesObject(Long maxSizeMaybe) throws IOException {
+        var slotPtr = resolved();
         var reader = this.db.core.reader();
 
-        switch (this.slotPtr.slot().tag()) {
+        switch (slotPtr.slot().tag()) {
             case NONE -> {
                 return new Database.Bytes(new byte[0]);
             }
             case BYTES -> {
-                this.db.core.seek(this.slotPtr.slot().value());
+                this.db.core.seek(slotPtr.slot().value());
                 var valueSize = reader.readLong();
 
                 if (maxSizeMaybe != null && valueSize > maxSizeMaybe) {
@@ -93,7 +126,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 reader.readFully(value);
 
                 byte[] formatTag = null;
-                if (this.slotPtr.slot().full()) {
+                if (slotPtr.slot().full()) {
                     this.db.core.seek(startPosition + valueSize);
                     formatTag = new byte[2];
                     reader.readFully(formatTag);
@@ -103,10 +136,10 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             }
             case SHORT_BYTES -> {
                 var buffer = ByteBuffer.allocate(8);
-                buffer.putLong(this.slotPtr.slot().value());
+                buffer.putLong(slotPtr.slot().value());
                 var bytes = buffer.array();
 
-                var totalSize = this.slotPtr.slot().full() ? bytes.length - 2 : bytes.length;
+                var totalSize = slotPtr.slot().full() ? bytes.length - 2 : bytes.length;
 
                 var valueSize = 0;
                 for (byte b : bytes) {
@@ -119,7 +152,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 }
 
                 byte[] formatTag = null;
-                if (this.slotPtr.slot().full()) {
+                if (slotPtr.slot().full()) {
                     formatTag = Arrays.copyOfRange(bytes, totalSize, bytes.length);
                 }
 
@@ -142,19 +175,9 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     }
 
     public KeyValuePairCursor readKeyValuePair() throws IOException {
-        var reader = this.db.core.reader();
-
-        if (this.slotPtr.slot().tag() != Tag.KV_PAIR) {
-            throw new Database.UnexpectedTagException();
-        }
-
-        this.db.core.seek(this.slotPtr.slot().value());
-        var kvPairBytes = new byte[Database.KeyValuePair.length(this.db.header.hashSize())];
-        reader.readFully(kvPairBytes);
-        var kvPair = Database.KeyValuePair.fromBytes(kvPairBytes, this.db.header.hashSize());
-
-        var hashPos = this.slotPtr.slot().value();
-        var keySlotPos = hashPos + this.db.header.hashSize();
+        var slotPtr = resolved();
+        var kvPair = this.db.readKvPair(slotPtr.slot());
+        var keySlotPos = slotPtr.slot().value() + this.db.kvKeyOffset(slotPtr.slot().tag());
         var valueSlotPos = keySlotPos + Slot.length;
 
         return new KeyValuePairCursor(
@@ -165,21 +188,22 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     }
 
     public Reader reader() throws IOException {
+        var slotPtr = resolved();
         var reader = this.db.core.reader();
 
-        switch (this.slotPtr.slot().tag()) {
+        switch (slotPtr.slot().tag()) {
             case BYTES -> {
-                this.db.core.seek(this.slotPtr.slot().value());
+                this.db.core.seek(slotPtr.slot().value());
                 var size = reader.readLong();
                 var startPosition = this.db.core.position();
                 return new Reader(this, size, startPosition, 0);
             }
             case SHORT_BYTES -> {
                 var buffer = ByteBuffer.allocate(8);
-                buffer.putLong(this.slotPtr.slot().value());
+                buffer.putLong(slotPtr.slot().value());
                 var bytes = buffer.array();
 
-                var totalSize = this.slotPtr.slot().full() ? bytes.length - 2 : bytes.length;
+                var totalSize = slotPtr.slot().full() ? bytes.length - 2 : bytes.length;
 
                 var valueSize = 0;
                 for (byte b : bytes) {
@@ -188,7 +212,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 }
 
                 // add one to get past the tag byte
-                var startPosition = this.slotPtr.position() + 1;
+                var startPosition = slotPtr.position() + 1;
                 return new Reader(this, valueSize, startPosition, 0);
             }
             default -> throw new Database.UnexpectedTagException();
@@ -196,35 +220,36 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     }
 
     public long count() throws IOException {
+        var slotPtr = resolved();
         var reader = this.db.core.reader();
-        switch (this.slotPtr.slot().tag()) {
+        switch (slotPtr.slot().tag()) {
             case NONE -> {
                 return 0;
             }
             case ARRAY_LIST -> {
-                this.db.core.seek(this.slotPtr.slot().value());
+                this.db.core.seek(slotPtr.slot().value());
                 var headerBytes = new byte[Database.ArrayListHeader.length];
                 reader.readFully(headerBytes);
                 var header = Database.ArrayListHeader.fromBytes(headerBytes);
                 return header.size();
             }
             case LINKED_ARRAY_LIST, SORTED_MAP, SORTED_SET -> {
-                this.db.core.seek(this.slotPtr.slot().value());
+                this.db.core.seek(slotPtr.slot().value());
                 var headerBytes = new byte[Database.BTreeHeader.length];
                 reader.readFully(headerBytes);
                 var header = Database.BTreeHeader.fromBytes(headerBytes);
                 return header.size();
             }
             case BYTES -> {
-                this.db.core.seek(this.slotPtr.slot().value());
+                this.db.core.seek(slotPtr.slot().value());
                 return reader.readLong();
             }
             case SHORT_BYTES -> {
                 var buffer = ByteBuffer.allocate(8);
-                buffer.putLong(this.slotPtr.slot().value());
+                buffer.putLong(slotPtr.slot().value());
                 var bytes = buffer.array();
 
-                var totalSize = this.slotPtr.slot().full() ? bytes.length - 2 : bytes.length;
+                var totalSize = slotPtr.slot().full() ? bytes.length - 2 : bytes.length;
 
                 var size = 0;
                 for (byte b : bytes) {
@@ -234,7 +259,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 return size;
             }
             case COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
-                this.db.core.seek(this.slotPtr.slot().value());
+                this.db.core.seek(slotPtr.slot().value());
                 return reader.readLong();
             }
             default -> throw new Database.UnexpectedTagException();
@@ -370,14 +395,15 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         // rank. negatives count from the end (-1 is the last entry); anything
         // out of range returns -1 (yield nothing).
         private static long resolveStartIndex(long index, long size) {
-            var resolved = index < 0 ? index + size : index;
-            if (resolved < 0 || resolved >= size) return -1;
-            return resolved;
+            var resolvedIndex = index < 0 ? index + size : index;
+            if (resolvedIndex < 0 || resolvedIndex >= size) return -1;
+            return resolvedIndex;
         }
 
         // start a sorted-map iterator at the entry with rank startIndex (the count
         // descent), iterating in key order from there
-        public static Iterator initSortedFromIndex(ReadCursor cursor, long startIndex) throws IOException {
+        public static Iterator initSortedFromIndex(ReadCursor unresolvedCursor, long startIndex) throws IOException {
+            var cursor = unresolvedCursor.resolvedCursor();
             switch (cursor.slotPtr.slot().tag()) {
                 // an unwritten map is NONE (like iterator()): yield nothing
                 case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
@@ -396,7 +422,8 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         // start an array-list iterator at startIndex, descending the radix trie
         // straight to that index. negatives count from the end; out of range
         // (or an unwritten list) yields nothing.
-        public static Iterator initArrayListFromIndex(ReadCursor cursor, long startIndex) throws IOException {
+        public static Iterator initArrayListFromIndex(ReadCursor unresolvedCursor, long startIndex) throws IOException {
+            var cursor = unresolvedCursor.resolvedCursor();
             switch (cursor.slotPtr.slot().tag()) {
                 // an unwritten list is NONE (like iterator()): yield nothing
                 case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
@@ -419,7 +446,8 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
 
         // start a linked-array-list iterator at startIndex, descending the
         // count-augmented b-tree straight to that index. negatives count from the end.
-        public static Iterator initLinkedArrayListFromIndex(ReadCursor cursor, long startIndex) throws IOException {
+        public static Iterator initLinkedArrayListFromIndex(ReadCursor unresolvedCursor, long startIndex) throws IOException {
+            var cursor = unresolvedCursor.resolvedCursor();
             switch (cursor.slotPtr.slot().tag()) {
                 // an unwritten list is NONE (like iterator()): yield nothing
                 case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
@@ -439,7 +467,8 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         }
 
         // start a sorted-map iterator at the first entry with key >= startKey
-        public static Iterator initSortedFromKey(ReadCursor cursor, byte[] startKey) throws IOException {
+        public static Iterator initSortedFromKey(ReadCursor unresolvedCursor, byte[] startKey) throws IOException {
+            var cursor = unresolvedCursor.resolvedCursor();
             switch (cursor.slotPtr.slot().tag()) {
                 // an unwritten map is NONE (like iterator()): yield nothing
                 case NONE -> { return new Iterator(cursor, 0, 0, new Stack<Level>()); }
@@ -560,7 +589,8 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
             }
         }
 
-        public Iterator(ReadCursor cursor) throws IOException {
+        public Iterator(ReadCursor unresolvedCursor) throws IOException {
+            var cursor = unresolvedCursor.resolvedCursor();
             this.cursor = cursor;
             switch (cursor.slotPtr.slot().tag()) {
                 case NONE -> {

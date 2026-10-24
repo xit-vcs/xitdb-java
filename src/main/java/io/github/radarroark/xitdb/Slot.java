@@ -34,7 +34,7 @@ public record Slot(long value, Tag tag, boolean full) implements Database.Writea
         return switch (this.tag) {
             case NONE, UINT, INT, FLOAT, SHORT_BYTES -> null;
             case INDEX, ARRAY_LIST, LINKED_ARRAY_LIST, HASH_MAP, KV_PAIR, BYTES,
-                 HASH_SET, COUNTED_HASH_MAP, COUNTED_HASH_SET, SORTED_MAP, SORTED_SET -> this.value;
+                 HASH_SET, COUNTED_HASH_MAP, COUNTED_HASH_SET, SORTED_MAP, SORTED_SET, SORTED_KV_PAIR -> this.value;
         };
     }
 
