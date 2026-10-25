@@ -1,7 +1,7 @@
 package io.github.radarroark.xitdb;
 
 /**
- * what a streaming replica sends its source, so the source knows which
+ * what a replica sends its source, so the source knows which
  * bytes to send back (see {@link Database#replicationStart})
  */
 public record ReplicaState(

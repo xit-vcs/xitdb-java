@@ -15,7 +15,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         this.db = db;
     }
 
-    // for a streaming root cursor, this reads the root again (see resolved).
+    // for a root cursor, this reads the root again (see resolved).
     // Slotted.slot can't throw checked exceptions, so a failed read is unchecked.
     @Override
     public Slot slot() {
@@ -26,7 +26,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
         }
     }
 
-    // a streaming root cursor only has a snapshot of the root slot,
+    // a root cursor only has a snapshot of the root slot,
     // which goes stale after the next transaction, so read it again.
     // the result points at the copy of the root slot in the newest
     // trailer, not the root header, so it is a fixed snapshot: the
@@ -34,7 +34,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     // one commit, even if more are made.
     // every method that reads slotPtr must go through this.
     SlotPointer resolved() throws IOException {
-        if (this.db.header.streaming() && this.db.isRoot(this.slotPtr)) {
+        if (Database.isRoot(this.slotPtr)) {
             var header = this.db.readRootHeader();
             if (header.fileSize() < Database.RootTrailer.length) throw new Database.InvalidDatabaseException();
             // the root slot is the first thing in the trailer

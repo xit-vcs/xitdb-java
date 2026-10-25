@@ -22,8 +22,6 @@ public class Database {
     public volatile Header header;
     public Long txStart;
     volatile Transaction transaction;
-    // streaming mode only. see ROOT_HEADER_START.
-    public long fileId = 0;
 
     // for file IDs and commit IDs
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -32,19 +30,19 @@ public class Database {
         final Thread thread = Thread.currentThread();
         volatile boolean aborted;
         Long rootPosition;
-        // streaming mode only. the copy of the root slot that the transaction works on
+        // the copy of the root slot that the transaction works on
         Long scratchPosition;
         Long frozenAt;
     }
 
     public static final short VERSION = 1;
     public static final byte[] MAGIC_NUMBER = new byte[]{'x', 'i', 't'};
-    public static final int DATABASE_START = Header.length;
-    // streaming mode only. the database header is followed by a random file
-    // ID, which never changes, and then the root header. the file ID is part
-    // of every trailer's checksum, so a replica can't be extended with bytes
-    // from a different file.
-    public static final int ROOT_HEADER_START = DATABASE_START + 8;
+    // the database header is followed by the root header. the top-level data
+    // is a root slot of any type, and every write to it is a copy-on-write
+    // transaction that appends a trailer holding the new root slot. the root
+    // header only caches the latest trailer, so every other committed byte is
+    // immutable, and a replica stays in sync by copying the bytes it doesn't have.
+    public static final int ROOT_HEADER_START = Header.length;
     public static final int ROOT_HEADER_END = ROOT_HEADER_START + RootHeader.length;
     public static final int BIT_COUNT = 4;
     public static final int SLOT_COUNT = 1 << BIT_COUNT;
@@ -63,9 +61,9 @@ public class Database {
     public static final int BTREE_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
     public static final int BTREE_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (Slot.length + 8) * BTREE_SLOT_COUNT;
     // sorted_map / sorted_set node block: [kind: u8][num: u8] followed by, for a
-    // leaf, BTREE_SLOT_COUNT .sorted_kv_pair slots (.kv_pair for entries written by
-    // version 0); for a branch, BTREE_SLOT_COUNT child slots, then BTREE_SLOT_COUNT
-    // separator slots, then BTREE_SLOT_COUNT u64 counts
+    // leaf, BTREE_SLOT_COUNT .sorted_kv_pair slots; for a branch, BTREE_SLOT_COUNT
+    // child slots, then BTREE_SLOT_COUNT separator slots, then BTREE_SLOT_COUNT
+    // u64 counts
     public static final int SORTED_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
     public static final int SORTED_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (Slot.length * 2 + 8) * BTREE_SLOT_COUNT;
 
@@ -88,12 +86,9 @@ public class Database {
 
         core.seek(0);
         if (core.length() == 0) {
-            // new databases are always written with the newest version
-            this.header = new Header(hasher.id(), (short)this.md.getDigestLength(), VERSION, Tag.NONE, MAGIC_NUMBER);
-            this.fileId = fileId != null ? fileId : RANDOM.nextLong();
+            this.header = new Header(fileId != null ? fileId : RANDOM.nextLong(), hasher.id(), (short)this.md.getDigestLength(), VERSION, MAGIC_NUMBER);
             this.header.write(core);
             var writer = core.writer();
-            writer.writeLong(this.fileId);
             // write the root header and commit an empty root, so the
             // file ends with a trailer like after any transaction
             writer.write(new RootHeader(0, new Slot()).toBytes());
@@ -103,7 +98,6 @@ public class Database {
             this.core.sync();
         } else {
             this.header = readAndValidateHeader();
-            if (this.header.streaming()) this.fileId = readFileId();
             committedSize();
         }
     }
@@ -154,40 +148,17 @@ public class Database {
         return header;
     }
 
-    // the root tag only changes once, when the top-level data is initialized.
-    // if we haven't seen that happen, another instance may have done it since
-    // we read the header.
-    Header refreshHeader() throws IOException {
-        var header = this.header;
-        // in streaming mode the tag stays NONE, because the root slot carries the type
-        if (header.tag() == Tag.NONE && !header.streaming()) {
-            synchronized (this) {
-                header = this.header;
-                if (header.tag() == Tag.NONE) {
-                    header = readAndValidateHeader();
-                    this.header = header;
-                }
-            }
-        }
-        return header;
-    }
-
     public WriteCursor rootCursor() throws IOException {
-        // in streaming mode, the cursor only holds a snapshot of the root
-        // slot, and every operation that starts at it reads the root again.
-        // if this read fails, the cursor looks empty and the next operation
-        // throws the exception.
-        if (this.header.streaming()) {
-            Slot root;
-            try {
-                root = readRootSlot();
-            } catch (IOException | DatabaseException e) {
-                root = new Slot();
-            }
-            return new WriteCursor(new SlotPointer((long) ROOT_HEADER_START, root), this);
+        // the cursor only holds a snapshot of the root slot, and every
+        // operation that starts at it reads the root again. if this read
+        // fails, the cursor looks empty and the next operation throws the exception.
+        Slot root;
+        try {
+            root = readRootSlot();
+        } catch (IOException | DatabaseException e) {
+            root = new Slot();
         }
-        var header = refreshHeader();
-        return new WriteCursor(new SlotPointer(null, new Slot(DATABASE_START, header.tag)), this);
+        return new WriteCursor(new SlotPointer((long) ROOT_HEADER_START, root), this);
     }
 
     /**
@@ -238,8 +209,7 @@ public class Database {
      * resets and borrows the supplied offsets map without closing it.
      *
      * the target must be a new or empty database, or this throws
-     * `TargetNotEmptyException`. it is always written with the newest version,
-     * so this is also how a version 0 database is migrated.
+     * `TargetNotEmptyException`.
      */
     public Database compact(Core targetCore, OffsetMap offsetMap) throws Exception {
         // cached offsets only apply to this compaction's target
@@ -250,12 +220,9 @@ public class Database {
         // the target must be a new or empty database, because compaction
         // writes to it with ordinary transactions. this also rejects
         // compacting a database into its own file.
-        if (!target.header.streaming() || !target.readRootSlot().empty()) throw new TargetNotEmptyException();
+        if (!target.readRootSlot().empty()) throw new TargetNotEmptyException();
 
-        // in streaming mode, the root slot carries the type of the top-level data
-        var sourceRoot = this.header.streaming()
-            ? readRootSlot()
-            : new Slot(DATABASE_START, this.header.tag());
+        var sourceRoot = readRootSlot();
 
         // an empty root compacts to a new database. a root explicitly
         // set to null isn't empty, so it is remapped below.
@@ -280,29 +247,26 @@ public class Database {
                     });
                 }
             }
-            // any other root is remapped whole. this is also how a version 0
-            // database with a top-level hash map is migrated.
+            // any other root is remapped whole
             default -> target.runContext(cursor -> cursor.write(compactor.remapSlot(sourceRoot)));
         }
 
         return target;
     }
 
-    /** streaming mode only. this database's ReplicaState. */
+    /** this database's ReplicaState. */
     public ReplicaState replicaState() throws IOException {
-        if (!this.header.streaming()) throw new StreamingModeRequiredException();
         var committedSize = committedSize();
         return new ReplicaState(committedSize, readRootTrailer(committedSize).checksum());
     }
 
     /**
-     * streaming mode only. where to start sending committed bytes to a replica
-     * in state. that's its committed size if its bytes are a prefix of this
-     * database, or 0 if it must be replaced, because it's a replica of another
-     * file or it has diverged from this one.
+     * where to start sending committed bytes to a replica in state. that's its
+     * committed size if its bytes are a prefix of this database, or 0 if it must
+     * be replaced, because it's a replica of another file or it has diverged
+     * from this one.
      */
     public long replicationStart(ReplicaState state) throws IOException {
-        if (!this.header.streaming()) throw new StreamingModeRequiredException();
         if (state.committedSize() > committedSize()) return 0;
         RootTrailer trailer;
         try {
@@ -314,9 +278,8 @@ public class Database {
     }
 
     /**
-     * streaming mode only. writes the committed bytes from start up to
-     * end to writer. start is usually from replicationStart, and end
-     * can't be past committedSize. committed bytes never change except for
+     * writes the committed bytes from start up to end to writer. start is
+     * usually from replicationStart, and end can't be past committedSize. committed bytes never change except for
      * the root header, so when start is 0, a root header matching end is
      * written, making the bytes a complete database by themselves.
      */
@@ -327,14 +290,12 @@ public class Database {
     }
 
     /**
-     * streaming mode only. like readCommitted, but returns a stream that reads
-     * the bytes on demand instead of writing them all to an OutputStream.
+     * like readCommitted, but returns a stream that reads the bytes on demand instead of writing them all to an OutputStream.
      * committed bytes never change, so the stream stays valid while this
      * database keeps committing. it shares this database's core, so only read
      * it while writes are happening if the core supports concurrent reads.
      */
     public InputStream openCommitted(long start, long end) throws IOException {
-        if (!this.header.streaming()) throw new StreamingModeRequiredException();
         if (start < 0 || start > end || end > committedSize()) throw new InvalidRangeException();
         if (start > 0 && start < ROOT_HEADER_END) throw new InvalidRangeException();
 
@@ -373,8 +334,7 @@ public class Database {
     }
 
     /**
-     * streaming mode only. writes len bytes from reader at start and
-     * commits them. they must be the bytes from readCommitted, so they end
+     * writes len bytes from reader at start and commits them. they must be the bytes from readCommitted, so they end
      * with a trailer. when start is 0, this database is replaced by them;
      * otherwise start must be this database's committedSize.
      */
@@ -394,14 +354,12 @@ public class Database {
     }
 
     /**
-     * streaming mode only. like applyReplicated, but returns a stream to write
-     * the len bytes to. they are written to this database as they arrive, and
+     * like applyReplicated, but returns a stream to write the len bytes to. they are written to this database as they arrive, and
      * close commits them. if fewer than len bytes were written, or they don't end
      * with a trailer, close throws and the database stays at its last commit.
      * when start is 0, this database is truncated now and replaced by the bytes.
      */
     public OutputStream openReplicated(long start, long len) throws IOException {
-        if (!this.header.streaming()) throw new StreamingModeRequiredException();
         if (len < 0) throw new InvalidRangeException();
         if (start == 0) {
             this.core.setLength(0);
@@ -445,12 +403,9 @@ public class Database {
     // commits len bytes written at start by a replication stream
     private void commitReplicated(long start, long len) throws IOException {
         if (start == 0) {
-            // the bytes are a different database, with its own header and file ID
+            // the bytes are a different database, with its own header
             this.core.sync();
-            var header = readAndValidateHeader();
-            if (!header.streaming()) throw new InvalidDatabaseException();
-            this.header = header;
-            this.fileId = readFileId();
+            this.header = readAndValidateHeader();
             committedSize();
         } else if (len > 0) {
             // the bytes must end with a trailer. update the root header to match it.
@@ -464,90 +419,40 @@ public class Database {
     // private
 
     /**
-     * the number of bytes that belong to committed transactions. in streaming
-     * mode, they never change except for the root header (see readCommitted).
+     * the number of bytes that belong to committed transactions. they never
+     * change except for the root header (see readCommitted).
      */
     public long committedSize() throws IOException {
-        if (this.header.streaming()) {
-            var rootHeader = readRootHeader();
-            var minimumSize = ROOT_HEADER_END + RootTrailer.length;
-            if (rootHeader.fileSize() < minimumSize) throw new InvalidDatabaseException();
-            if (this.core.length() < rootHeader.fileSize()) throw new TruncatedDatabaseException();
-            // the committed bytes must end with a trailer matching the header
-            if (!readRootTrailer(rootHeader.fileSize()).root().equals(rootHeader.root())) {
-                throw new InvalidDatabaseException();
-            }
-            return rootHeader.fileSize();
+        var rootHeader = readRootHeader();
+        var minimumSize = ROOT_HEADER_END + RootTrailer.length;
+        if (rootHeader.fileSize() < minimumSize) throw new InvalidDatabaseException();
+        if (this.core.length() < rootHeader.fileSize()) throw new TruncatedDatabaseException();
+        // the committed bytes must end with a trailer matching the header
+        if (!readRootTrailer(rootHeader.fileSize()).root().equals(rootHeader.root())) {
+            throw new InvalidDatabaseException();
         }
-
-        if (this.header.tag() != Tag.ARRAY_LIST) return this.core.length();
-
-        this.core.seek(DATABASE_START);
-        var reader = this.core.reader();
-        var headerBytes = new byte[TopLevelArrayListHeader.length];
-        reader.readFully(headerBytes);
-        var header = TopLevelArrayListHeader.fromBytes(headerBytes);
-
-        var minimumSize = DATABASE_START + TopLevelArrayListHeader.length + INDEX_BLOCK_SIZE;
-        var committedSize = header.fileSize() == 0 ? minimumSize : header.fileSize();
-
-        if (header.fileSize() == 0 && header.parent().size() != 0) throw new InvalidDatabaseException();
-        if (committedSize < minimumSize) throw new InvalidDatabaseException();
-
-        var fileSize = this.core.length();
-
-        if (fileSize < committedSize) throw new TruncatedDatabaseException();
-
-        return committedSize;
+        return rootHeader.fileSize();
     }
 
     void truncate() throws IOException {
         var committedSize = committedSize();
         var active = this.transaction;
         if (active != null && active.frozenAt != null && active.frozenAt > committedSize) {
-            // retain frozen bytes without publishing the failed transaction
-            if (this.header.streaming()) {
-                // commit the unchanged root again after them, so the
-                // committed bytes still end with a trailer
-                if (this.core.length() > active.frozenAt) {
-                    this.core.setLength(active.frozenAt);
-                }
-                commitRoot(readRootSlot(), RANDOM.nextLong());
-                this.core.sync();
-                committedSize = active.frozenAt + RootTrailer.length;
-            } else {
-                this.core.sync();
-                this.core.seek(DATABASE_START + ArrayListHeader.length);
-                this.core.writer().writeLong(active.frozenAt);
-                this.core.sync();
-                committedSize = active.frozenAt;
+            // retain frozen bytes without publishing the failed transaction.
+            // commit the unchanged root again after them, so the committed
+            // bytes still end with a trailer
+            if (this.core.length() > active.frozenAt) {
+                this.core.setLength(active.frozenAt);
             }
+            commitRoot(readRootSlot(), RANDOM.nextLong());
+            this.core.sync();
+            committedSize = active.frozenAt + RootTrailer.length;
         }
         if (this.core.length() > committedSize) {
             this.core.setLength(committedSize);
         }
     }
 
-    private void updateCommittedSize() throws IOException {
-        this.core.sync();
-        if (this.header.tag() == Tag.ARRAY_LIST) {
-            this.core.seek(DATABASE_START + ArrayListHeader.length);
-            var committedSize = this.core.reader().readLong();
-            var fileSize = this.core.length();
-            if (fileSize == committedSize) return;
-            this.core.seek(DATABASE_START + ArrayListHeader.length);
-            this.core.writer().writeLong(fileSize);
-            this.core.sync();
-        }
-    }
-
-    // streaming mode only
-    private long readFileId() throws IOException {
-        this.core.seek(DATABASE_START);
-        return this.core.reader().readLong();
-    }
-
-    // streaming mode only
     RootHeader readRootHeader() throws IOException {
         this.core.seek(ROOT_HEADER_START);
         var bytes = new byte[RootHeader.length];
@@ -555,12 +460,12 @@ public class Database {
         return RootHeader.fromBytes(bytes);
     }
 
-    // streaming mode only. the most recently committed root slot.
+    // the most recently committed root slot
     Slot readRootSlot() throws IOException {
         return readRootHeader().root();
     }
 
-    // streaming mode only. the trailer that ends at end.
+    // the trailer that ends at end
     private RootTrailer readRootTrailer(long end) throws IOException {
         if (end < RootTrailer.length) throw new InvalidDatabaseException();
         var trailerPos = end - RootTrailer.length;
@@ -570,17 +475,17 @@ public class Database {
         var rootBytes = Arrays.copyOfRange(bytes, 0, Slot.length);
         var commitId = ByteBuffer.wrap(bytes, Slot.length, 8).getLong();
         var checksum = ByteBuffer.wrap(bytes, Slot.length + 8, 8).getLong();
-        if (checksum != RootTrailer.computeChecksum(this.fileId, trailerPos, rootBytes, commitId)) throw new InvalidDatabaseException();
+        if (checksum != RootTrailer.computeChecksum(this.header.fileId(), trailerPos, rootBytes, commitId)) throw new InvalidDatabaseException();
         return new RootTrailer(checksum, commitId, Slot.fromBytes(rootBytes));
     }
 
-    // streaming mode only. completes a transaction by appending a trailer
-    // for root and updating the root header. callers must sync afterwards
-    // to make the header itself durable.
+    // completes a transaction by appending a trailer for root and updating
+    // the root header. callers must sync afterwards to make the header itself
+    // durable.
     private void commitRoot(Slot root, long commitId) throws IOException {
         var trailerPos = this.core.length();
         this.core.seek(trailerPos);
-        this.core.writer().write(RootTrailer.init(this.fileId, trailerPos, root, commitId).toBytes());
+        this.core.writer().write(RootTrailer.init(this.header.fileId(), trailerPos, root, commitId).toBytes());
 
         // flush and fsync before updating the header, because updating
         // the header is what completes the transaction. without the
@@ -592,8 +497,8 @@ public class Database {
         writeRootHeader(root);
     }
 
-    // streaming mode only. points the root header at root, which must be
-    // in the trailer that ends the file.
+    // points the root header at root, which must be in the trailer that
+    // ends the file.
     private void writeRootHeader(Slot root) throws IOException {
         var fileSize = this.core.length();
         this.core.seek(ROOT_HEADER_START);
@@ -601,16 +506,8 @@ public class Database {
     }
 
     // whether this slot pointer is the root of the database
-    boolean isRoot(SlotPointer slotPtr) {
-        if (this.header.streaming()) return slotPtr.position() != null && slotPtr.position() == ROOT_HEADER_START;
-        return slotPtr.position() == null && slotPtr.slot().value() == DATABASE_START;
-    }
-
-    // whether writes must happen inside a transaction. in version 0 databases,
-    // only an array list root needs them; otherwise no moment can reference
-    // the data, so it is all mutable in place.
-    boolean transactional() {
-        return this.header.streaming() || this.header.tag() == Tag.ARRAY_LIST;
+    static boolean isRoot(SlotPointer slotPtr) {
+        return slotPtr.position() != null && slotPtr.position() == ROOT_HEADER_START;
     }
 
     // the collection tag that an init path part creates, if any
@@ -646,13 +543,9 @@ public class Database {
     }
 
     // whether the data at ptr predates this transaction, so it must be
-    // copied before it is modified. outside a transaction nothing is old,
-    // but a transactional database can't be written outside one.
+    // copied before it is modified. writes only happen inside a transaction.
     private boolean isOld(long ptr) {
-        if (this.txStart == null) {
-            if (this.transactional()) throw new ExpectedTxStartException();
-            return false;
-        }
+        if (this.txStart == null) throw new ExpectedTxStartException();
         return ptr < this.txStart;
     }
 
@@ -704,10 +597,10 @@ public class Database {
     }
 
     // copy frozen collection storage before mutation to preserve existing readers
-    private SlotPointer copyCollectionIfFrozen(SlotPointer slotPtr, boolean isTopLevel, PathPart init) throws Exception {
-        if (!isTopLevel && this.transaction != null
+    private SlotPointer copyCollectionIfFrozen(SlotPointer slotPtr, PathPart init) throws Exception {
+        if (this.transaction != null
             && this.transaction.frozenAt != null && slotPtr.slot().value() < this.transaction.frozenAt) {
-            return init.readSlotPointer(this, false, WriteMode.READ_WRITE, new PathPart[]{init}, 0, slotPtr);
+            return init.readSlotPointer(this, WriteMode.READ_WRITE, new PathPart[]{init}, 0, slotPtr);
         }
         return slotPtr;
     }
@@ -721,8 +614,8 @@ public class Database {
         }
         var part = path[pathI];
 
-        // in streaming mode, every write that starts at the root is a transaction
-        if (this.header.streaming() && this.isRoot(slotPtr)) {
+        // every write that starts at the root is a transaction
+        if (isRoot(slotPtr)) {
             var root = readRootSlot();
 
             // the position of a read path doesn't matter, but it must not be
@@ -789,50 +682,33 @@ public class Database {
 
         if (writeMode == WriteMode.READ_WRITE) checkFrozenSlot(slotPtr);
 
-        // in streaming mode the root is handled above, so the
-        // top-level special cases below only apply to version 0
-        var isTopLevel = !this.header.streaming() && this.isRoot(slotPtr);
-
-        var isTxStart = writeMode == WriteMode.READ_WRITE && isTopLevel && this.header.tag == Tag.ARRAY_LIST && this.txStart == null;
-        if (isTxStart) {
-            // discard data left by an unfinished transaction after a crash.
-            this.truncate();
-            this.txStart = this.core.length();
-        }
-
-        try {
-            return part.readSlotPointer(this, isTopLevel, writeMode, path, pathI, slotPtr);
-        } finally {
-            if (isTxStart) {
-                this.txStart = null;
-            }
-        }
+        return part.readSlotPointer(this, writeMode, path, pathI, slotPtr);
     }
 
     // records
 
     public static record Header (
+        // a random ID that never changes. it is part of every trailer's checksum,
+        // so a replica can't be extended with bytes from a different file.
+        long fileId,
         int hashId,
         // the size in bytes of all hashes used by the database.
         short hashSize,
-        // the file format version. any version above 0 is streaming mode.
+        // the file format version
         short version,
-        // the root tag, representing the type of the top-level data.
-        // in version 0 databases, it starts as NONE and becomes ARRAY_LIST
-        // once ArrayListInit is first called. in streaming mode it stays
-        // NONE, because the root slot carries the type instead.
-        Tag tag,
         byte[] magicNumber
     ) {
-        public static int length = 12;
+        public static int length = 20;
 
         public byte[] toBytes() {
             var buffer = ByteBuffer.allocate(length);
             buffer.put(this.magicNumber);
-            buffer.put((byte)this.tag.ordinal());
+            // currently unused
+            buffer.put((byte)0);
             buffer.putShort(this.version);
             buffer.putShort(this.hashSize);
             buffer.putInt(this.hashId);
+            buffer.putLong(this.fileId);
             return buffer.array();
         }
 
@@ -840,11 +716,13 @@ public class Database {
             var reader = core.reader();
             var magicNumber = new byte[3];
             reader.readFully(magicNumber);
-            var tag = Tag.valueOf(reader.readByte() & 0b0111_1111);
+            // currently unused
+            reader.readByte();
             var version = reader.readShort();
             var hashSize = reader.readShort();
             var hashId = reader.readInt();
-            return new Header(hashId, hashSize, version, tag, magicNumber);
+            var fileId = reader.readLong();
+            return new Header(fileId, hashId, hashSize, version, magicNumber);
         }
 
         public void write(Core core) throws IOException {
@@ -856,26 +734,9 @@ public class Database {
             if (!Arrays.equals(this.magicNumber, MAGIC_NUMBER)) {
                 throw new InvalidDatabaseException();
             }
-            if (this.version > VERSION) {
+            if (this.version != VERSION) {
                 throw new InvalidVersionException();
             }
-            if (this.streaming() && this.tag != Tag.NONE) {
-                throw new InvalidDatabaseException();
-            }
-        }
-
-        // whether the database is in streaming mode, which every version above 0
-        // is (new databases always are). the top-level data is a root slot of any
-        // type, and every write to it is a copy-on-write transaction that appends
-        // a trailer holding the new root slot. the root header only caches the
-        // latest trailer, so every other committed byte is immutable, and a
-        // replica stays in sync by copying the bytes it doesn't have.
-        public boolean streaming() {
-            return this.version > 0;
-        }
-
-        public Header withTag(Tag tag) {
-            return new Header(this.hashId, this.hashSize, this.version, tag, this.magicNumber);
         }
     }
 
@@ -901,26 +762,7 @@ public class Database {
         }
     }
 
-    public static record TopLevelArrayListHeader(long fileSize, ArrayListHeader parent) {
-        public static int length = 8 + ArrayListHeader.length;
-
-        public byte[] toBytes() {
-            var buffer = ByteBuffer.allocate(length);
-            buffer.put(this.parent.toBytes());
-            buffer.putLong(this.fileSize);
-            return buffer.array();
-        }
-
-        public static TopLevelArrayListHeader fromBytes(byte[] bytes) {
-            var buffer = ByteBuffer.wrap(bytes);
-            var parentBytes = new byte[ArrayListHeader.length];
-            buffer.get(parentBytes);
-            var parent = ArrayListHeader.fromBytes(parentBytes);
-            var fileSize = checkLong(buffer.getLong());
-            return new TopLevelArrayListHeader(fileSize, parent);
-        }
-    }
-    // streaming mode only. rewritten at every commit, as a cache of the latest
+    // rewritten at every commit, as a cache of the latest
     // trailer. it is written big endian, so the root slot comes first on disk.
     public static record RootHeader(long fileSize, Slot root) {
         public static final int length = Slot.length + 8;
@@ -942,7 +784,7 @@ public class Database {
         }
     }
 
-    // streaming mode only. appended at the end of every transaction, so the
+    // appended at the end of every transaction, so the
     // committed bytes (up to the root header's fileSize) always end with one
     // it is written big endian, so root comes first on disk.
     public static record RootTrailer(
@@ -1009,8 +851,7 @@ public class Database {
         }
     }
 
-    // a KeyValuePair without the hash, which sorted maps don't need.
-    // sorted map entries written by version 0 databases are KeyValuePairs anyway.
+    // a KeyValuePair without the hash, which sorted maps don't need
     public static record SortedKeyValuePair(Slot valueSlot, Slot keySlot) {
         public static int length = Slot.length * 2;
 
@@ -1098,8 +939,7 @@ public class Database {
     // sorted_map / sorted_set: a count-augmented B+tree keyed on arbitrary byte
     // strings, ordered lexicographically. reuses the b-tree's capacity constants,
     // persistence model (txStart reuse), and the BTreeHeader {rootPtr, size}
-    // header. a leaf holds .sorted_kv_pair entries (.kv_pair for entries written
-    // by version 0) in ascending key order;
+    // header. a leaf holds .sorted_kv_pair entries in ascending key order;
     // a branch holds child slots, separator slots (the smallest key in each child's
     // subtree; separators[0] is an unused sentinel), and per-child subtree counts.
     public static final class SortedNode {
@@ -1145,40 +985,12 @@ public class Database {
     public static record SortedEntry(Slot kvSlot, Slot keySlot) {}
 
     public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, SortedMapInit, SortedMapGet, SortedMapGetIndex, SortedMapRemove, WriteData, Context {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception;
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception;
     }
 
     public static record ArrayListInit() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
-
-            if (isTopLevel) {
-                var writer = db.core.writer();
-
-                // if the top level array list hasn't been initialized
-                if (db.header.tag == Tag.NONE) {
-                    // write the array list header
-                    db.core.seek(DATABASE_START);
-                    var arrayListPtr = DATABASE_START + TopLevelArrayListHeader.length;
-                    writer.write((new TopLevelArrayListHeader(
-                        0,
-                        new ArrayListHeader(arrayListPtr, 0))
-                    ).toBytes());
-
-                    // write the first block
-                    writer.write(new byte[INDEX_BLOCK_SIZE]);
-
-                    // update db header
-                    db.core.seek(0);
-                    db.header = db.header.withTag(Tag.ARRAY_LIST);
-                    writer.write(db.header.toBytes());
-                } else if (db.header.tag != Tag.ARRAY_LIST) {
-                    throw new UnexpectedTagException();
-                }
-
-                var nextSlotPtr = slotPtr.withSlot(slotPtr.slot().withTag(Tag.ARRAY_LIST));
-                return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
-            }
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
             long position = slotPtr.position();
@@ -1238,17 +1050,14 @@ public class Database {
     }
 
     public static record ArrayListGet(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
-            if (writeMode == WriteMode.READ_WRITE && isTopLevel && db.header.tag() == Tag.ARRAY_LIST) throw new WriteNotAllowedException();
-
-            var tag = isTopLevel ? db.header.tag : slotPtr.slot().tag();
-            switch (tag) {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+            switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
                 case ARRAY_LIST -> {}
                 default -> throw new UnexpectedTagException();
             }
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new ArrayListInit());
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit());
             var nextArrayListStart = slotPtr.slot().value();
             var index = this.index();
 
@@ -1264,21 +1073,20 @@ public class Database {
             var key = index < 0 ? header.size - Math.abs(index) : index;
             var lastKey = header.size - 1;
             var shift = (byte) (lastKey < SLOT_COUNT ? 0 : Math.log(lastKey) / Math.log(SLOT_COUNT));
-            var finalSlotPtr = db.readArrayListSlot(header.ptr, key, shift, writeMode, isTopLevel);
+            var finalSlotPtr = db.readArrayListSlot(header.ptr, key, shift, writeMode);
 
             return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr);
         }
     }
 
     public static record ArrayListAppend() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
-            var tag = isTopLevel ? db.header.tag : slotPtr.slot().tag();
-            if (tag != Tag.ARRAY_LIST) throw new UnexpectedTagException();
+            if (slotPtr.slot().tag() != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
             var reader = db.core.reader();
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new ArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit());
             var nextArrayListStart = slotPtr.slot().value();
 
             // read header
@@ -1288,50 +1096,29 @@ public class Database {
             var origHeader = ArrayListHeader.fromBytes(headerBytes);
 
             // append
-            var appendResult = db.readArrayListSlotAppend(origHeader, writeMode, isTopLevel);
+            var appendResult = db.readArrayListSlotAppend(origHeader, writeMode);
+            // update the header before callbacks can freeze it
             var writer = db.core.writer();
-            // update nested headers before callbacks can freeze them
-            if (!isTopLevel) {
-                db.core.seek(nextArrayListStart);
-                writer.write(appendResult.header().toBytes());
-            }
+            db.core.seek(nextArrayListStart);
+            writer.write(appendResult.header().toBytes());
             // the appended moment of a top-level history becomes the transaction's
-            // root slot, so it stays writable after a freeze. in streaming mode,
-            // the history is the copy of the root slot.
-            if (db.transaction != null && (isTopLevel || slotPtr.position() != null && slotPtr.position().equals(db.transaction.scratchPosition))) {
+            // root slot, so it stays writable after a freeze. the history is the
+            // copy of the root slot.
+            if (db.transaction != null && slotPtr.position() != null && slotPtr.position().equals(db.transaction.scratchPosition)) {
                 db.transaction.rootPosition = appendResult.slotPtr().position();
             }
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, appendResult.slotPtr());
-
-            if (isTopLevel) {
-                // flush and fsync before updating the header, because updating
-                // the header is what completes the transaction. without the
-                // fsync, the OS could persist the header before the data it
-                // points to, so a crash could commit a moment whose data never
-                // reached disk. writePath does a second sync afterwards to make
-                // the header itself durable.
-                db.core.sync();
-
-                var fileSize = db.core.length();
-                var header = new TopLevelArrayListHeader(fileSize, appendResult.header);
-
-                // update header
-                db.core.seek(nextArrayListStart);
-                writer.write(header.toBytes());
-            }
-
-            return finalSlotPtr;
+            return db.readSlotPointer(writeMode, path, pathI + 1, appendResult.slotPtr());
         }
     }
 
     public static record ArrayListSlice(long size) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
             var reader = db.core.reader();
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new ArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit());
             var nextArrayListStart = slotPtr.slot().value();
 
             // read header
@@ -1341,31 +1128,18 @@ public class Database {
             var origHeader = ArrayListHeader.fromBytes(headerBytes);
 
             // slice
-            var sliceHeader = db.readArrayListSlice(origHeader, this.size(), isTopLevel);
+            var sliceHeader = db.readArrayListSlice(origHeader, this.size());
+            // update the header before callbacks can freeze it
             var writer = db.core.writer();
-            // update nested headers before callbacks can freeze them
-            if (!isTopLevel) {
-                db.core.seek(nextArrayListStart);
-                writer.write(sliceHeader.toBytes());
-            }
-            var finalSlotPtr = db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
-
-            // commit the top-level header after the callback's writes are durable
-            if (isTopLevel) {
-                db.core.sync();
-                db.core.seek(nextArrayListStart);
-                writer.write(sliceHeader.toBytes());
-            }
-
-            return finalSlotPtr;
+            db.core.seek(nextArrayListStart);
+            writer.write(sliceHeader.toBytes());
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
         }
     }
 
     public static record LinkedArrayListInit() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
-
-            if (isTopLevel) throw new InvalidTopLevelTypeException();
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
             long position = slotPtr.position();
@@ -1410,7 +1184,7 @@ public class Database {
     }
 
     public static record LinkedArrayListGet(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
                 case LINKED_ARRAY_LIST -> {}
@@ -1419,7 +1193,7 @@ public class Database {
 
             var index = this.index();
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1449,12 +1223,12 @@ public class Database {
     }
 
     public static record LinkedArrayListAppend() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1477,12 +1251,12 @@ public class Database {
     }
 
     public static record LinkedArrayListSlice(long offset, long size) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1511,14 +1285,14 @@ public class Database {
     }
 
     public static record LinkedArrayListConcat(Slot list) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
             if (this.list().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1548,12 +1322,12 @@ public class Database {
     }
 
     public static record LinkedArrayListInsert(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1581,12 +1355,12 @@ public class Database {
     }
 
     public static record LinkedArrayListRemove(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1620,48 +1394,12 @@ public class Database {
             this(false, false);
         }
 
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             Tag tag = this.counted() ?
                         (this.set() ? Tag.COUNTED_HASH_SET : Tag.COUNTED_HASH_MAP) :
                         (this.set() ? Tag.HASH_SET : Tag.HASH_MAP);
-
-            if (isTopLevel) {
-                var writer = db.core.writer();
-
-                // if the top level hash map hasn't been initialized
-                if (db.header.tag == Tag.NONE) {
-                    db.core.seek(DATABASE_START);
-
-                    if (this.counted()) {
-                        writer.writeLong(0);
-                    }
-
-                    // write the first block
-                    writer.write(new byte[INDEX_BLOCK_SIZE]);
-
-                    // update db header
-                    db.core.seek(0);
-                    db.header = db.header.withTag(tag);
-                    writer.write(db.header.toBytes());
-                } else {
-                    // map and set variants are interchangeable, but counted-ness must
-                    // match because counted layouts have an 8-byte count prefix
-                    switch (db.header.tag) {
-                        case HASH_MAP, HASH_SET -> {
-                            if (this.counted()) throw new UnexpectedTagException();
-                        }
-                        case COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
-                            if (!this.counted()) throw new UnexpectedTagException();
-                        }
-                        default -> throw new UnexpectedTagException();
-                    }
-                }
-
-                var nextSlotPtr = slotPtr.withSlot(slotPtr.slot().withTag(tag));
-                return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
-            }
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
             long position = slotPtr.position();
@@ -1726,7 +1464,7 @@ public class Database {
     }
 
     public static record HashMapGet(HashMapGetTarget target) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             boolean counted = false;
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
@@ -1735,10 +1473,10 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
             long indexPos = counted ? slotPtr.slot().value() + 8 : slotPtr.slot().value();
 
-            var res = db.readMapSlot(indexPos, db.checkHash(this.target()), (byte)0, writeMode, isTopLevel, this.target());
+            var res = db.readMapSlot(indexPos, db.checkHash(this.target()), (byte)0, writeMode, this.target());
 
             if (writeMode == WriteMode.READ_WRITE && counted && res.isEmpty()) {
                 var reader = db.core.reader();
@@ -1754,7 +1492,7 @@ public class Database {
     }
 
     public static record HashMapRemove(byte[] hash) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             boolean counted = false;
@@ -1765,12 +1503,12 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
             long indexPos = counted ? slotPtr.slot().value() + 8 : slotPtr.slot().value();
 
             boolean keyFound = true;
             try {
-                db.removeMapSlot(indexPos, db.checkHash(this.hash()), (byte)0, isTopLevel);
+                db.removeMapSlot(indexPos, db.checkHash(this.hash()), (byte)0);
             } catch (KeyNotFoundException e) {
                 keyFound = false;
             }
@@ -1795,9 +1533,8 @@ public class Database {
             this(false);
         }
 
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
-            if (isTopLevel) throw new InvalidTopLevelTypeException();
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
             long position = slotPtr.position();
             Tag tag = this.set() ? Tag.SORTED_SET : Tag.SORTED_MAP;
@@ -1837,7 +1574,7 @@ public class Database {
     }
 
     public static record SortedMapGet(SortedMapGetTarget target) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
                 case SORTED_MAP, SORTED_SET -> {}
@@ -1850,7 +1587,7 @@ public class Database {
             else if (this.target() instanceof SortedMapGetValue t) key = t.key();
             else throw new IllegalArgumentException();
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1881,7 +1618,7 @@ public class Database {
     }
 
     public static record SortedMapGetIndex(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_WRITE) throw new WriteNotAllowedException();
 
             switch (slotPtr.slot().tag()) {
@@ -1911,7 +1648,7 @@ public class Database {
     }
 
     public static record SortedMapRemove(byte[] key) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             switch (slotPtr.slot().tag()) {
@@ -1920,7 +1657,7 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, isTopLevel, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1940,7 +1677,7 @@ public class Database {
     }
 
     public static record WriteData(WriteableData data) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
@@ -2003,9 +1740,8 @@ public class Database {
     }
 
     public static record Context(ContextFunction function) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, boolean isTopLevel, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
-            if (isTopLevel && db.header.tag() == Tag.ARRAY_LIST) throw new CursorNotWriteableException();
 
             if (pathI != path.length - 1) throw new PathPartMustBeAtEndException();
 
@@ -2080,7 +1816,6 @@ public class Database {
     public static class StreamTooLongException extends DatabaseException {}
     public static class EndOfStreamException extends DatabaseException {}
     public static class InvalidOffsetException extends DatabaseException {}
-    public static class InvalidTopLevelTypeException extends DatabaseException {}
     public static class ExpectedUnsignedLongException extends DatabaseException {}
     public static class NoAvailableSlotsException extends DatabaseException {}
     public static class MustSetNewSlotsToFullException extends DatabaseException {}
@@ -2091,7 +1826,6 @@ public class Database {
     public static class MaxShiftExceededException extends DatabaseException {}
     public static class InvalidBTreeNodeException extends DatabaseException {}
     public static class InvalidBTreeNodeKindException extends DatabaseException {}
-    public static class StreamingModeRequiredException extends DatabaseException {}
     public static class InvalidRangeException extends DatabaseException {}
     public static class TargetNotEmptyException extends DatabaseException {}
 
@@ -2099,7 +1833,7 @@ public class Database {
 
     public static record HashMapGetResult(SlotPointer slotPtr, boolean isEmpty) {}
 
-    private HashMapGetResult readMapSlot(long indexPos, byte[] keyHash, byte keyOffset, WriteMode writeMode, boolean isTopLevel, HashMapGetTarget target) throws IOException {
+    private HashMapGetResult readMapSlot(long indexPos, byte[] keyHash, byte keyOffset, WriteMode writeMode, HashMapGetTarget target) throws IOException {
         if (keyOffset > (this.header.hashSize() * 8) / BIT_COUNT) {
             throw new KeyOffsetExceededException();
         }
@@ -2151,7 +1885,7 @@ public class Database {
             }
             case INDEX -> {
                 var nextPtr = ptr;
-                if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
+                if (writeMode == WriteMode.READ_WRITE) {
                     nextPtr = copyIndexBlockIfOld(ptr);
                     if (nextPtr != ptr) {
                         // make slot point to the copied block
@@ -2159,7 +1893,7 @@ public class Database {
                         this.core.writer().write(new Slot(nextPtr, Tag.INDEX).toBytes());
                     }
                 }
-                return readMapSlot(nextPtr, keyHash, (byte) (keyOffset + 1), writeMode, isTopLevel, target);
+                return readMapSlot(nextPtr, keyHash, (byte) (keyOffset + 1), writeMode, target);
             }
             case KV_PAIR -> {
                 this.core.seek(ptr);
@@ -2168,7 +1902,7 @@ public class Database {
                 var kvPair = KeyValuePair.fromBytes(kvPairBytes, this.header.hashSize());
 
                 if (Arrays.equals(kvPair.hash(), keyHash)) {
-                    if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
+                    if (writeMode == WriteMode.READ_WRITE) {
                         if (isOld(ptr)) {
                             var writer = this.core.writer();
                             // write hash and key/val slots
@@ -2225,7 +1959,7 @@ public class Database {
                             writer.write(new byte[INDEX_BLOCK_SIZE]);
                             this.core.seek(nextIndexPos + (Slot.length * nextI));
                             writer.write(slot.toBytes());
-                            var res = readMapSlot(nextIndexPos, keyHash, (byte) (keyOffset + 1), writeMode, isTopLevel, target);
+                            var res = readMapSlot(nextIndexPos, keyHash, (byte) (keyOffset + 1), writeMode, target);
                             this.core.seek(slotPos);
                             writer.write(new Slot(nextIndexPos, Tag.INDEX).toBytes());
                             return res;
@@ -2238,7 +1972,7 @@ public class Database {
         }
     }
 
-    private Slot removeMapSlot(long indexPos, byte[] keyHash, byte keyOffset, boolean isTopLevel) throws IOException {
+    private Slot removeMapSlot(long indexPos, byte[] keyHash, byte keyOffset) throws IOException {
         if (keyOffset > (this.header.hashSize() * 8) / BIT_COUNT) {
             throw new KeyOffsetExceededException();
         }
@@ -2266,7 +2000,7 @@ public class Database {
         // get the slot that will replace the current slot
         var nextSlot = switch (slot.tag()) {
             case NONE -> throw new KeyNotFoundException();
-            case INDEX -> removeMapSlot(slot.value(), keyHash, (byte) (keyOffset + 1), isTopLevel);
+            case INDEX -> removeMapSlot(slot.value(), keyHash, (byte) (keyOffset + 1));
             case KV_PAIR -> {
                 this.core.seek(slot.value());
                 var kvPairBytes = new byte[KeyValuePair.length(this.header.hashSize())];
@@ -2322,7 +2056,7 @@ public class Database {
         // there was more than one used slot, or a single INDEX slot,
         // so we must keep this index block. update the slot in it,
         // copying the block first unless it belongs to this transaction.
-        var nextIndexPos = isTopLevel ? indexPos : copyIndexBlockIfOld(indexPos);
+        var nextIndexPos = copyIndexBlockIfOld(indexPos);
         this.core.seek(nextIndexPos + (Slot.length * i));
         writer.write(nextSlot.toBytes());
         return new Slot(nextIndexPos, Tag.INDEX);
@@ -2403,11 +2137,9 @@ public class Database {
     // a node is safe to mutate in place when it was created in the current
     // transaction (offset >= txStart), since no committed moment and no pre-concat
     // sharing can reference it. concat advances txStart (an implicit freeze)
-    // precisely so its shared subtrees fall below it here. for an ephemeral
-    // (non-transactional) database there is no transaction, so everything is
-    // mutable in place until a concat first sets txStart.
+    // precisely so its shared subtrees fall below it here.
     private boolean btreeReusable(long ptr) throws IOException {
-        // a transactional database outside a transaction can't reuse anything
+        // nothing can be reused outside a transaction
         try {
             return !isOld(ptr);
         } catch (ExpectedTxStartException e) {
@@ -2775,7 +2507,7 @@ public class Database {
 
     public static record ArrayListAppendResult(ArrayListHeader header, SlotPointer slotPtr) {}
 
-    private ArrayListAppendResult readArrayListSlotAppend(ArrayListHeader header, WriteMode writeMode, boolean isTopLevel) throws IOException {
+    private ArrayListAppendResult readArrayListSlotAppend(ArrayListHeader header, WriteMode writeMode) throws IOException {
         var writer = this.core.writer();
 
         var indexPos = header.ptr();
@@ -2795,7 +2527,7 @@ public class Database {
             indexPos = nextIndexPos;
         }
 
-        var slotPtr = readArrayListSlot(indexPos, key, nextShift, writeMode, isTopLevel);
+        var slotPtr = readArrayListSlot(indexPos, key, nextShift, writeMode);
         // clear values left by a rollback or slice
         slotPtr = slotPtr.withSlot(new Slot());
         this.core.seek(slotPtr.position());
@@ -2803,7 +2535,7 @@ public class Database {
         return new ArrayListAppendResult(new ArrayListHeader(indexPos, header.size() + 1), slotPtr);
     }
 
-    private SlotPointer readArrayListSlot(long indexPos, long key, byte shift, WriteMode writeMode, boolean isTopLevel) throws IOException {
+    private SlotPointer readArrayListSlot(long indexPos, long key, byte shift, WriteMode writeMode) throws IOException {
         if (shift >= MAX_BRANCH_LENGTH) throw new MaxShiftExceededException();
 
         var reader = this.core.reader();
@@ -2830,21 +2562,16 @@ public class Database {
                         var nextIndexPos = this.core.length();
                         this.core.seek(nextIndexPos);
                         writer.write(new byte[INDEX_BLOCK_SIZE]);
-                        // if top level array list, update the file size in the list
-                        // header to prevent truncation from destroying this block
-                        if (isTopLevel) {
-                            this.updateCommittedSize();
-                        }
                         this.core.seek(slotPos);
                         writer.write(new Slot(nextIndexPos, Tag.INDEX).toBytes());
-                        return readArrayListSlot(nextIndexPos, key, (byte)(shift - 1), writeMode, isTopLevel);
+                        return readArrayListSlot(nextIndexPos, key, (byte)(shift - 1), writeMode);
                     }
                     default -> throw new UnreachableException();
                 }
             }
             case INDEX -> {
                 var nextPtr = ptr;
-                if (writeMode == WriteMode.READ_WRITE && !isTopLevel) {
+                if (writeMode == WriteMode.READ_WRITE) {
                     nextPtr = copyIndexBlockIfOld(ptr);
                     if (nextPtr != ptr) {
                         // make slot point to the copied block
@@ -2853,13 +2580,13 @@ public class Database {
                         writer.write(new Slot(nextPtr, Tag.INDEX).toBytes());
                     }
                 }
-                return readArrayListSlot(nextPtr, key, (byte)(shift - 1), writeMode, isTopLevel);
+                return readArrayListSlot(nextPtr, key, (byte)(shift - 1), writeMode);
             }
             default -> throw new UnexpectedTagException();
         }
     }
 
-    private ArrayListHeader readArrayListSlice(ArrayListHeader header, long size, boolean isTopLevel) throws IOException {
+    private ArrayListHeader readArrayListSlice(ArrayListHeader header, long size) throws IOException {
         var reader = this.core.reader();
 
         if (size > header.size() || size < 0) {
@@ -2886,9 +2613,7 @@ public class Database {
             }
             // the new root may still belong to a past moment. unlike child
             // nodes, root nodes are written directly, so copy it now.
-            if (!isTopLevel) {
-                indexPos = copyIndexBlockIfOld(indexPos);
-            }
+            indexPos = copyIndexBlockIfOld(indexPos);
             return new ArrayListHeader(indexPos, size);
         }
     }
@@ -3150,12 +2875,10 @@ public class Database {
 
     // materialize a new leaf entry: write the key bytes and a key-value pair with
     // an empty value (the caller fills it in). navigation is by key bytes, so the
-    // entry has no hash, except in version 0 databases, which older builds must
-    // still be able to read.
+    // entry has no hash.
     private SortedEntry sortedNewEntry(byte[] key) throws IOException {
         var keySlot = writeKey(key);
-        var tag = this.header.streaming() ? Tag.SORTED_KV_PAIR : Tag.KV_PAIR;
-        var kvSlot = writeKvPair(tag, new KeyValuePair(new Slot(), keySlot, new byte[this.header.hashSize()]));
+        var kvSlot = writeKvPair(Tag.SORTED_KV_PAIR, new KeyValuePair(new Slot(), keySlot, new byte[this.header.hashSize()]));
         return new SortedEntry(kvSlot, keySlot);
     }
 
