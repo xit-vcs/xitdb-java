@@ -1374,10 +1374,18 @@ public class Database {
             }
             var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
-            // remove = join the parts before and after the removed element
-            var before = db.btreeSplit(header.rootPtr(), rank);
-            var after = db.btreeSplit(before.right(), 1);
-            var newRootPtr = db.btreeJoin(before.left(), after.right());
+            long newRootPtr;
+            if (header.size() == 1) {
+                newRootPtr = db.btreeNewRoot();
+            } else {
+                var root = db.btreeRemove(header.rootPtr(), rank);
+                newRootPtr = db.btreeWriteNode(root, header.rootPtr());
+                // a root left with one child is replaced by it
+                while (root.kind == BTreeNodeKind.BRANCH && root.num == 1) {
+                    newRootPtr = root.children[0].value();
+                    root = db.readBTreeNode(newRootPtr);
+                }
+            }
 
             // update the header before recursing into the rest of the path, so that
             // a failure there leaves the tree and header consistent
@@ -2314,6 +2322,70 @@ public class Database {
         throw new UnreachableException();
     }
 
+    // remove the element at `rank` within the subtree at nodePtr, returning the
+    // node left behind for the caller to write. an emptied child is dropped and a
+    // child left under half full is merged with a neighbor it fits with, so every
+    // leaf stays at the same depth.
+    private BTreeNode btreeRemove(long nodePtr, long rank) throws IOException {
+        var node = readBTreeNode(nodePtr);
+        switch (node.kind) {
+            case LEAF -> {
+                int r = (int) rank;
+                System.arraycopy(node.values, r + 1, node.values, r, node.num - 1 - r);
+                node.num -= 1;
+                node.values[node.num] = new Slot();
+            }
+            case BRANCH -> {
+                int i = 0;
+                long rem = rank;
+                while (i + 1 < node.num && rem >= node.counts[i]) {
+                    rem -= node.counts[i];
+                    i++;
+                }
+                var childPtr = node.children[i].value();
+                var child = btreeRemove(childPtr, rem);
+                if (child.num == 0) {
+                    btreeDropChild(node, i);
+                    return node;
+                }
+                if (child.num < BTREE_SPLIT_COUNT && node.num > 1) {
+                    // the pair is i and its right neighbor, or its left one if it is last
+                    int first = i + 1 < node.num ? i : i - 1;
+                    var neighbor = readBTreeNode(node.children[first == i ? i + 1 : first].value());
+                    if (child.num + neighbor.num <= BTREE_SLOT_COUNT) {
+                        child = first == i ? btreeConcatNodes(child, neighbor) : btreeConcatNodes(neighbor, child);
+                        btreeDropChild(node, first + 1);
+                        i = first;
+                    }
+                }
+                node.children[i] = new Slot(btreeWriteNode(child, childPtr), Tag.INDEX);
+                node.counts[i] = child.subtreeCount();
+            }
+        }
+        return node;
+    }
+
+    private static void btreeDropChild(BTreeNode branch, int i) {
+        System.arraycopy(branch.children, i + 1, branch.children, i, branch.num - 1 - i);
+        System.arraycopy(branch.counts, i + 1, branch.counts, i, branch.num - 1 - i);
+        branch.num -= 1;
+        branch.children[branch.num] = new Slot();
+        branch.counts[branch.num] = 0;
+    }
+
+    // two nodes of the same kind whose entries fit in one node, a before b
+    private static BTreeNode btreeConcatNodes(BTreeNode a, BTreeNode b) {
+        switch (a.kind) {
+            case LEAF -> System.arraycopy(b.values, 0, a.values, a.num, b.num);
+            case BRANCH -> {
+                System.arraycopy(b.children, 0, a.children, a.num, b.num);
+                System.arraycopy(b.counts, 0, a.counts, a.num, b.num);
+            }
+        }
+        a.num += b.num;
+        return a;
+    }
+
     // join (concat): a true O(log n), structure-sharing concatenation of two trees
     // where every element of `a` precedes every element of `b`. unlike the rebuild
     // helpers above, untouched subtrees are shared by pointer, so concatenating a
@@ -2459,8 +2531,8 @@ public class Database {
         return btreeMakeRoot(result);
     }
 
-    // split (used by slice and remove): a true O(log n), structure-sharing split of a
-    // tree into [0, rank) and [rank, size). partial nodes along the path are
+    // split (used by slice): a true O(log n), structure-sharing split of a tree
+    // into [0, rank) and [rank, size). partial nodes along the path are
     // reassembled with join, so the result trees stay balanced.
 
     // build a tree from a run of sibling children (already height-h-1 subtrees):
