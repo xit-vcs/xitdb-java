@@ -4,14 +4,22 @@ import java.io.IOException;
 
 public class WriteCursor extends ReadCursor {
     private final Database.Transaction transaction;
+    // writes through this cursor copy any data written before this
+    // position, even within the transaction (see freeze)
+    private long frozenAt;
 
     public WriteCursor(SlotPointer slotPtr, Database db) {
-        this(slotPtr, db, db.transaction);
+        this(slotPtr, db, 0);
     }
 
-    private WriteCursor(SlotPointer slotPtr, Database db, Database.Transaction transaction) {
+    WriteCursor(SlotPointer slotPtr, Database db, long frozenAt) {
+        this(slotPtr, db, db.transaction, frozenAt);
+    }
+
+    private WriteCursor(SlotPointer slotPtr, Database db, Database.Transaction transaction, long frozenAt) {
         super(slotPtr, db);
         this.transaction = slotPtr.position() == null || Database.isRoot(slotPtr) ? null : transaction;
+        this.frozenAt = frozenAt;
     }
 
     // require the active transaction, its owning thread, and a writable slot
@@ -38,9 +46,9 @@ public class WriteCursor extends ReadCursor {
         return super.slot();
     }
 
-    // reload after freezing because copy-on-write may change where the slot points
+    // reload because an earlier write may have moved what the slot points to
     private void reloadSlot() throws IOException {
-        if (this.transaction != null && this.transaction.frozenAt != null && this.slotPtr.position() != null) {
+        if (this.transaction != null && this.slotPtr.position() != null) {
             this.db.core.seek(this.slotPtr.position());
             var bytes = new byte[Slot.length];
             this.db.core.reader().readFully(bytes);
@@ -61,7 +69,7 @@ public class WriteCursor extends ReadCursor {
             SlotPointer slotPtr;
             try {
                 reloadSlot();
-                slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr);
+                slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_WRITE, path, 0, this.slotPtr, this.frozenAt);
             } catch (Exception | Error e) {
                 if (startsTransaction) this.db.transaction.aborted = true;
                 // only truncate when the error escapes the outer write.
@@ -77,12 +85,24 @@ public class WriteCursor extends ReadCursor {
                 this.db.core.sync();
             }
             reloadSlot();
-            var cursor = new WriteCursor(slotPtr, this.db);
+            var cursor = new WriteCursor(slotPtr, this.db, this.frozenAt);
             cursor.reloadSlot();
             return cursor;
         } finally {
             if (startsTransaction) this.db.transaction = null;
         }
+    }
+
+    /**
+     * makes writes through this cursor, and cursors made from it afterward,
+     * copy what the transaction wrote so far instead of changing it in
+     * place. call it after pointing this slot at data still referred to
+     * elsewhere, and before wrapping the cursor in a collection, which keeps
+     * its own copy. unlike Database.freeze, other cursors keep writing in place.
+     */
+    public void freeze() throws IOException {
+        if (this.db.txStart == null) throw new Database.ExpectedTxStartException();
+        this.frozenAt = this.db.core.length();
     }
 
     public void write(Database.WriteableData data) throws Exception {
@@ -117,8 +137,8 @@ public class WriteCursor extends ReadCursor {
     public KeyValuePairCursor readKeyValuePair() throws IOException {
         var kvPairCursor = super.readKeyValuePair();
         return new KeyValuePairCursor(
-            new WriteCursor(kvPairCursor.valueCursor.slotPtr, this.db, this.transaction),
-            new WriteCursor(kvPairCursor.keyCursor.slotPtr, this.db, this.transaction),
+            new WriteCursor(kvPairCursor.valueCursor.slotPtr, this.db, this.transaction, this.frozenAt),
+            new WriteCursor(kvPairCursor.keyCursor.slotPtr, this.db, this.transaction, this.frozenAt),
             kvPairCursor.hash
         );
     }

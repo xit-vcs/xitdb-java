@@ -51,7 +51,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     // returns null for a missing value; explicitly stored none values have a cursor
     public ReadCursor readPath(Database.PathPart[] path) throws Exception {
         try {
-            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, resolved());
+            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, resolved(), 0);
             return new ReadCursor(slotPtr, this.db);
         } catch (Database.KeyNotFoundException e) {
             return null;
@@ -61,7 +61,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     // returns null for a missing value; explicitly stored none values have a full slot
     public Slot readPathSlot(Database.PathPart[] path) throws Exception {
         try {
-            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, resolved());
+            var slotPtr = this.db.readSlotPointer(Database.WriteMode.READ_ONLY, path, 0, resolved(), 0);
             if (!slotPtr.slot().empty()) {
                 return slotPtr.slot();
             } else {

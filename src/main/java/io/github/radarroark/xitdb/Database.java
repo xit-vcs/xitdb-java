@@ -542,16 +542,17 @@ public class Database {
         };
     }
 
-    // whether the data at ptr predates this transaction, so it must be
-    // copied before it is modified. writes only happen inside a transaction.
-    private boolean isOld(long ptr) {
+    // whether the data at ptr predates this transaction, or the writing
+    // cursor's freeze point, so it must be copied before it is modified.
+    // writes only happen inside a transaction.
+    private boolean isOld(long ptr, long frozenAt) {
         if (this.txStart == null) throw new ExpectedTxStartException();
-        return ptr < this.txStart;
+        return ptr < Math.max(this.txStart, frozenAt);
     }
 
     // copies an index block to the end unless it was made in this transaction
-    private long copyIndexBlockIfOld(long ptr) throws IOException {
-        if (!isOld(ptr)) return ptr;
+    private long copyIndexBlockIfOld(long ptr, long frozenAt) throws IOException {
+        if (!isOld(ptr, frozenAt)) return ptr;
         var indexBlock = new byte[INDEX_BLOCK_SIZE];
         this.core.seek(ptr);
         this.core.reader().readFully(indexBlock);
@@ -597,15 +598,15 @@ public class Database {
     }
 
     // copy frozen collection storage before mutation to preserve existing readers
-    private SlotPointer copyCollectionIfFrozen(SlotPointer slotPtr, PathPart init) throws Exception {
+    private SlotPointer copyCollectionIfFrozen(SlotPointer slotPtr, PathPart init, long frozenAt) throws Exception {
         if (this.transaction != null
             && this.transaction.frozenAt != null && slotPtr.slot().value() < this.transaction.frozenAt) {
-            return init.readSlotPointer(this, WriteMode.READ_WRITE, new PathPart[]{init}, 0, slotPtr);
+            return init.readSlotPointer(this, WriteMode.READ_WRITE, new PathPart[]{init}, 0, slotPtr, frozenAt);
         }
         return slotPtr;
     }
 
-    protected SlotPointer readSlotPointer(WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+    protected SlotPointer readSlotPointer(WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
         if (pathI == path.length) {
             if (writeMode == WriteMode.READ_ONLY && slotPtr.slot().empty()) {
                 throw new KeyNotFoundException();
@@ -621,7 +622,7 @@ public class Database {
             // the position of a read path doesn't matter, but it must not be
             // ROOT_HEADER_START or this would recurse forever
             if (writeMode == WriteMode.READ_ONLY) {
-                return readSlotPointer(writeMode, path, pathI, new SlotPointer(null, root));
+                return readSlotPointer(writeMode, path, pathI, new SlotPointer(null, root), frozenAt);
             }
 
             // initializing an initialized root is free, so a wrapper like
@@ -657,10 +658,10 @@ public class Database {
                 // has no enclosing init part, so run one here.
                 var initPart = initPartFor(root.tag());
                 if (initPart != null) {
-                    rootPtr = readSlotPointer(writeMode, new PathPart[]{initPart}, 0, rootPtr);
+                    rootPtr = readSlotPointer(writeMode, new PathPart[]{initPart}, 0, rootPtr, frozenAt);
                 }
 
-                var result = readSlotPointer(writeMode, path, pathI, rootPtr);
+                var result = readSlotPointer(writeMode, path, pathI, rootPtr, frozenAt);
 
                 // the copy now holds the new root, so commit it
                 this.core.seek(scratchPos);
@@ -682,7 +683,7 @@ public class Database {
 
         if (writeMode == WriteMode.READ_WRITE) checkFrozenSlot(slotPtr);
 
-        return part.readSlotPointer(this, writeMode, path, pathI, slotPtr);
+        return part.readSlotPointer(this, writeMode, path, pathI, slotPtr, frozenAt);
     }
 
     // records
@@ -985,11 +986,11 @@ public class Database {
     public static record SortedEntry(Slot kvSlot, Slot keySlot) {}
 
     public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, SortedMapInit, SortedMapGet, SortedMapGetIndex, SortedMapRemove, WriteData, Context {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception;
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception;
     }
 
     public static record ArrayListInit() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
@@ -1011,7 +1012,7 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(arrayListStart, Tag.ARRAY_LIST));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 case ARRAY_LIST -> {
                     var reader = db.core.reader();
@@ -1020,7 +1021,7 @@ public class Database {
                     var arrayListStart = slotPtr.slot().value();
 
                     // copy it to the end unless it was made in this transaction
-                    if (db.isOld(arrayListStart)) {
+                    if (db.isOld(arrayListStart, frozenAt)) {
                         // read existing block
                         db.core.seek(arrayListStart);
                         var headerBytes = new byte[ArrayListHeader.length];
@@ -1042,7 +1043,7 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(arrayListStart, Tag.ARRAY_LIST));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 default -> throw new UnexpectedTagException();
             }
@@ -1050,14 +1051,14 @@ public class Database {
     }
 
     public static record ArrayListGet(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
                 case ARRAY_LIST -> {}
                 default -> throw new UnexpectedTagException();
             }
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit());
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit(), frozenAt);
             var nextArrayListStart = slotPtr.slot().value();
             var index = this.index();
 
@@ -1073,20 +1074,20 @@ public class Database {
             var key = index < 0 ? header.size - Math.abs(index) : index;
             var lastKey = header.size - 1;
             var shift = (byte) (lastKey < SLOT_COUNT ? 0 : Math.log(lastKey) / Math.log(SLOT_COUNT));
-            var finalSlotPtr = db.readArrayListSlot(header.ptr, key, shift, writeMode);
+            var finalSlotPtr = db.readArrayListSlot(header.ptr, key, shift, writeMode, frozenAt);
 
-            return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr, frozenAt);
         }
     }
 
     public static record ArrayListAppend() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
             var reader = db.core.reader();
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit(), frozenAt);
             var nextArrayListStart = slotPtr.slot().value();
 
             // read header
@@ -1096,7 +1097,7 @@ public class Database {
             var origHeader = ArrayListHeader.fromBytes(headerBytes);
 
             // append
-            var appendResult = db.readArrayListSlotAppend(origHeader, writeMode);
+            var appendResult = db.readArrayListSlotAppend(origHeader, writeMode, frozenAt);
             // update the header before callbacks can freeze it
             var writer = db.core.writer();
             db.core.seek(nextArrayListStart);
@@ -1107,18 +1108,18 @@ public class Database {
             if (db.transaction != null && slotPtr.position() != null && slotPtr.position().equals(db.transaction.scratchPosition)) {
                 db.transaction.rootPosition = appendResult.slotPtr().position();
             }
-            return db.readSlotPointer(writeMode, path, pathI + 1, appendResult.slotPtr());
+            return db.readSlotPointer(writeMode, path, pathI + 1, appendResult.slotPtr(), frozenAt);
         }
     }
 
     public static record ArrayListSlice(long size) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.ARRAY_LIST) throw new UnexpectedTagException();
 
             var reader = db.core.reader();
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new ArrayListInit(), frozenAt);
             var nextArrayListStart = slotPtr.slot().value();
 
             // read header
@@ -1128,17 +1129,17 @@ public class Database {
             var origHeader = ArrayListHeader.fromBytes(headerBytes);
 
             // slice
-            var sliceHeader = db.readArrayListSlice(origHeader, this.size());
+            var sliceHeader = db.readArrayListSlice(origHeader, this.size(), frozenAt);
             // update the header before callbacks can freeze it
             var writer = db.core.writer();
             db.core.seek(nextArrayListStart);
             writer.write(sliceHeader.toBytes());
-            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr, frozenAt);
         }
     }
 
     public static record LinkedArrayListInit() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
@@ -1156,7 +1157,7 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, Tag.LINKED_ARRAY_LIST));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 case LINKED_ARRAY_LIST -> {
                     var headerPtr = slotPtr.slot().value();
@@ -1164,7 +1165,7 @@ public class Database {
                     // so past moments still pointing at the old header are unaffected.
                     // b-tree nodes are always appended, so only the header (updated in
                     // place by later operations in this tx) needs copying.
-                    if (db.isOld(headerPtr)) {
+                    if (db.isOld(headerPtr, frozenAt)) {
                         var reader = db.core.reader();
                         db.core.seek(headerPtr);
                         var headerBytes = new byte[BTreeHeader.length];
@@ -1176,7 +1177,7 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, Tag.LINKED_ARRAY_LIST));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 default -> throw new UnexpectedTagException();
             }
@@ -1184,7 +1185,7 @@ public class Database {
     }
 
     public static record LinkedArrayListGet(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
                 case LINKED_ARRAY_LIST -> {}
@@ -1193,7 +1194,7 @@ public class Database {
 
             var index = this.index();
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit(), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1207,28 +1208,28 @@ public class Database {
 
             if (writeMode == WriteMode.READ_ONLY) {
                 var finalSlotPtr = db.readBTreeSlot(header.rootPtr(), rank);
-                return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr);
+                return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr, frozenAt);
             } else {
                 // path-copy down to the value slot so the write is persistent
-                var writeSlot = db.btreeGetForWrite(header.rootPtr(), rank);
+                var writeSlot = db.btreeGetForWrite(header.rootPtr(), rank, frozenAt);
                 // update the header before callbacks can freeze it
                 if (writeSlot.nodePtr() != header.rootPtr()) {
                     var writer = db.core.writer();
                     db.core.seek(headerPtr);
                     writer.write(new BTreeHeader(writeSlot.nodePtr(), header.size()).toBytes());
                 }
-                return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(writeSlot.valuePosition(), writeSlot.slot()));
+                return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(writeSlot.valuePosition(), writeSlot.slot()), frozenAt);
             }
         }
     }
 
     public static record LinkedArrayListAppend() implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit(), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1236,7 +1237,7 @@ public class Database {
             reader.readFully(headerBytes);
             var header = BTreeHeader.fromBytes(headerBytes);
 
-            var result = db.btreeInsert(header.rootPtr(), header.size());
+            var result = db.btreeInsert(header.rootPtr(), header.size(), frozenAt);
             var newRootPtr = db.btreeGrowRoot(result);
 
             // update the header before filling in the value, so that a failure in
@@ -1246,17 +1247,17 @@ public class Database {
             writer.write(new BTreeHeader(newRootPtr, header.size() + 1).toBytes());
 
             // fill in the value via the rest of the path
-            return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
+            return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()), frozenAt);
         }
     }
 
     public static record LinkedArrayListSlice(long offset, long size) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit(), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1280,19 +1281,19 @@ public class Database {
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, this.size()).toBytes());
 
-            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr, frozenAt);
         }
     }
 
     public static record LinkedArrayListConcat(Slot list) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
             if (this.list().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit(), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1317,17 +1318,17 @@ public class Database {
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, headerA.size() + headerB.size()).toBytes());
 
-            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr, frozenAt);
         }
     }
 
     public static record LinkedArrayListInsert(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit(), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1341,7 +1342,7 @@ public class Database {
             }
             var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
-            var result = db.btreeInsert(header.rootPtr(), rank);
+            var result = db.btreeInsert(header.rootPtr(), rank, frozenAt);
             var newRootPtr = db.btreeGrowRoot(result);
 
             // update the header before filling in the value, so that a failure in
@@ -1350,17 +1351,17 @@ public class Database {
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, header.size() + 1).toBytes());
 
-            return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()));
+            return db.readSlotPointer(writeMode, path, pathI + 1, new SlotPointer(result.valuePosition(), new Slot()), frozenAt);
         }
     }
 
     public static record LinkedArrayListRemove(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.slot().tag() != Tag.LINKED_ARRAY_LIST) throw new UnexpectedTagException();
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit());
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new LinkedArrayListInit(), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1378,8 +1379,8 @@ public class Database {
             if (header.size() == 1) {
                 newRootPtr = db.btreeNewRoot();
             } else {
-                var root = db.btreeRemove(header.rootPtr(), rank);
-                newRootPtr = db.btreeWriteNode(root, header.rootPtr());
+                var root = db.btreeRemove(header.rootPtr(), rank, frozenAt);
+                newRootPtr = db.btreeWriteNode(root, header.rootPtr(), frozenAt);
                 // a root left with one child is replaced by it
                 while (root.kind == BTreeNodeKind.BRANCH && root.num == 1) {
                     newRootPtr = root.children[0].value();
@@ -1393,7 +1394,7 @@ public class Database {
             db.core.seek(headerPtr);
             writer.write(new BTreeHeader(newRootPtr, header.size() - 1).toBytes());
 
-            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, slotPtr, frozenAt);
         }
     }
 
@@ -1402,7 +1403,7 @@ public class Database {
             this(false, false);
         }
 
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             Tag tag = this.counted() ?
@@ -1426,7 +1427,7 @@ public class Database {
                     var nextSlotPr = new SlotPointer(position, new Slot(mapStart, tag));
                     db.core.seek(position);
                     writer.write(nextSlotPr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPr, frozenAt);
                 }
                 case HASH_MAP, HASH_SET, COUNTED_HASH_MAP, COUNTED_HASH_SET -> {
                     if (this.counted()) {
@@ -1447,7 +1448,7 @@ public class Database {
                     var mapStart = slotPtr.slot().value();
 
                     // copy it to the end unless it was made in this transaction
-                    if (db.isOld(mapStart)) {
+                    if (db.isOld(mapStart, frozenAt)) {
                         // read existing block
                         db.core.seek(mapStart);
                         Long mapCountMaybe = this.counted() ? reader.readLong() : null;
@@ -1464,7 +1465,7 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(mapStart, tag));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 default -> throw new UnexpectedTagException();
             }
@@ -1472,7 +1473,7 @@ public class Database {
     }
 
     public static record HashMapGet(HashMapGetTarget target) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             boolean counted = false;
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
@@ -1481,10 +1482,10 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET), frozenAt);
             long indexPos = counted ? slotPtr.slot().value() + 8 : slotPtr.slot().value();
 
-            var res = db.readMapSlot(indexPos, db.checkHash(this.target()), (byte)0, writeMode, this.target());
+            var res = db.readMapSlot(indexPos, db.checkHash(this.target()), (byte)0, writeMode, this.target(), frozenAt);
 
             if (writeMode == WriteMode.READ_WRITE && counted && res.isEmpty()) {
                 var reader = db.core.reader();
@@ -1495,12 +1496,12 @@ public class Database {
                 writer.writeLong(mapCount + 1);
             }
 
-            return db.readSlotPointer(writeMode, path, pathI + 1, res.slotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, res.slotPtr, frozenAt);
         }
     }
 
     public static record HashMapRemove(byte[] hash) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             boolean counted = false;
@@ -1511,12 +1512,12 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET));
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new HashMapInit(counted, slotPtr.slot().tag() == Tag.HASH_SET || slotPtr.slot().tag() == Tag.COUNTED_HASH_SET), frozenAt);
             long indexPos = counted ? slotPtr.slot().value() + 8 : slotPtr.slot().value();
 
             boolean keyFound = true;
             try {
-                db.removeMapSlot(indexPos, db.checkHash(this.hash()), (byte)0);
+                db.removeMapSlot(indexPos, db.checkHash(this.hash()), (byte)0, frozenAt);
             } catch (KeyNotFoundException e) {
                 keyFound = false;
             }
@@ -1541,7 +1542,7 @@ public class Database {
             this(false);
         }
 
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
             long position = slotPtr.position();
@@ -1556,13 +1557,13 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, tag));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 case SORTED_MAP, SORTED_SET -> {
                     if (slotPtr.slot().tag() != tag) throw new UnexpectedTagException();
                     var headerPtr = slotPtr.slot().value();
                     // copy the header into this transaction unless it was made in it
-                    if (db.isOld(headerPtr)) {
+                    if (db.isOld(headerPtr, frozenAt)) {
                         var reader = db.core.reader();
                         db.core.seek(headerPtr);
                         var headerBytes = new byte[BTreeHeader.length];
@@ -1574,7 +1575,7 @@ public class Database {
                     var nextSlotPtr = new SlotPointer(position, new Slot(headerPtr, tag));
                     db.core.seek(position);
                     writer.write(nextSlotPtr.slot().toBytes());
-                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+                    return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 default -> throw new UnexpectedTagException();
             }
@@ -1582,7 +1583,7 @@ public class Database {
     }
 
     public static record SortedMapGet(SortedMapGetTarget target) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             switch (slotPtr.slot().tag()) {
                 case NONE -> throw new KeyNotFoundException();
                 case SORTED_MAP, SORTED_SET -> {}
@@ -1595,7 +1596,7 @@ public class Database {
             else if (this.target() instanceof SortedMapGetValue t) key = t.key();
             else throw new IllegalArgumentException();
 
-            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
+            if (writeMode == WriteMode.READ_WRITE) slotPtr = db.copyCollectionIfFrozen(slotPtr, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1607,9 +1608,9 @@ public class Database {
                 var found = db.sortedGet(header.rootPtr(), key);
                 if (found == null) throw new KeyNotFoundException();
                 var targetSlot = db.sortedTargetSlot(found.slot(), this.target());
-                return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
+                return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
             } else {
-                var result = db.sortedPut(header.rootPtr(), key);
+                var result = db.sortedPut(header.rootPtr(), key, frozenAt);
                 var newRootPtr = db.sortedGrowRoot(result);
 
                 // update the header before filling in the value, so that a failure in
@@ -1620,13 +1621,13 @@ public class Database {
                 writer.write(new BTreeHeader(newRootPtr, header.size() + (result.added() ? 1 : 0)).toBytes());
 
                 var targetSlot = db.sortedTargetSlot(result.kvSlot(), this.target());
-                return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
+                return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
             }
         }
     }
 
     public static record SortedMapGetIndex(long index) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_WRITE) throw new WriteNotAllowedException();
 
             switch (slotPtr.slot().tag()) {
@@ -1651,12 +1652,12 @@ public class Database {
             var found = db.sortedGetByIndex(header.rootPtr(), rank);
             // return the entry so the caller can read key and value
             var targetSlot = new SlotPointer(found.position(), found.slot());
-            return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot);
+            return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
         }
     }
 
     public static record SortedMapRemove(byte[] key) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             switch (slotPtr.slot().tag()) {
@@ -1665,7 +1666,7 @@ public class Database {
                 default -> throw new UnexpectedTagException();
             }
 
-            slotPtr = db.copyCollectionIfFrozen(slotPtr, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET));
+            slotPtr = db.copyCollectionIfFrozen(slotPtr, new SortedMapInit(slotPtr.slot().tag() == Tag.SORTED_SET), frozenAt);
             var headerPtr = slotPtr.slot().value();
             var reader = db.core.reader();
             db.core.seek(headerPtr);
@@ -1673,7 +1674,7 @@ public class Database {
             reader.readFully(headerBytes);
             var header = BTreeHeader.fromBytes(headerBytes);
 
-            var result = db.sortedRemove(header.rootPtr(), this.key());
+            var result = db.sortedRemove(header.rootPtr(), this.key(), frozenAt);
             if (!result.found()) throw new KeyNotFoundException();
 
             var writer = db.core.writer();
@@ -1685,7 +1686,7 @@ public class Database {
     }
 
     public static record WriteData(WriteableData data) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (slotPtr.position() == null) throw new CursorNotWriteableException();
@@ -1743,17 +1744,17 @@ public class Database {
             writer.write(slot.toBytes());
 
             var nextSlotPtr = new SlotPointer(slotPtr.position(), slot);
-            return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr);
+            return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
         }
     }
 
     public static record Context(ContextFunction function) implements PathPart {
-        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr) throws Exception {
+        public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception {
             if (writeMode == WriteMode.READ_ONLY) throw new WriteNotAllowedException();
 
             if (pathI != path.length - 1) throw new PathPartMustBeAtEndException();
 
-            var nextCursor = new WriteCursor(slotPtr, db);
+            var nextCursor = new WriteCursor(slotPtr, db, frozenAt);
             this.function().run(nextCursor);
             return nextCursor.slotPtr;
         }
@@ -1841,7 +1842,7 @@ public class Database {
 
     public static record HashMapGetResult(SlotPointer slotPtr, boolean isEmpty) {}
 
-    private HashMapGetResult readMapSlot(long indexPos, byte[] keyHash, byte keyOffset, WriteMode writeMode, HashMapGetTarget target) throws IOException {
+    private HashMapGetResult readMapSlot(long indexPos, byte[] keyHash, byte keyOffset, WriteMode writeMode, HashMapGetTarget target, long frozenAt) throws IOException {
         if (keyOffset > (this.header.hashSize() * 8) / BIT_COUNT) {
             throw new KeyOffsetExceededException();
         }
@@ -1894,14 +1895,14 @@ public class Database {
             case INDEX -> {
                 var nextPtr = ptr;
                 if (writeMode == WriteMode.READ_WRITE) {
-                    nextPtr = copyIndexBlockIfOld(ptr);
+                    nextPtr = copyIndexBlockIfOld(ptr, frozenAt);
                     if (nextPtr != ptr) {
                         // make slot point to the copied block
                         this.core.seek(slotPos);
                         this.core.writer().write(new Slot(nextPtr, Tag.INDEX).toBytes());
                     }
                 }
-                return readMapSlot(nextPtr, keyHash, (byte) (keyOffset + 1), writeMode, target);
+                return readMapSlot(nextPtr, keyHash, (byte) (keyOffset + 1), writeMode, target, frozenAt);
             }
             case KV_PAIR -> {
                 this.core.seek(ptr);
@@ -1911,7 +1912,7 @@ public class Database {
 
                 if (Arrays.equals(kvPair.hash(), keyHash)) {
                     if (writeMode == WriteMode.READ_WRITE) {
-                        if (isOld(ptr)) {
+                        if (isOld(ptr, frozenAt)) {
                             var writer = this.core.writer();
                             // write hash and key/val slots
                             var hashPos = this.core.length();
@@ -1967,7 +1968,7 @@ public class Database {
                             writer.write(new byte[INDEX_BLOCK_SIZE]);
                             this.core.seek(nextIndexPos + (Slot.length * nextI));
                             writer.write(slot.toBytes());
-                            var res = readMapSlot(nextIndexPos, keyHash, (byte) (keyOffset + 1), writeMode, target);
+                            var res = readMapSlot(nextIndexPos, keyHash, (byte) (keyOffset + 1), writeMode, target, frozenAt);
                             this.core.seek(slotPos);
                             writer.write(new Slot(nextIndexPos, Tag.INDEX).toBytes());
                             return res;
@@ -1980,7 +1981,7 @@ public class Database {
         }
     }
 
-    private Slot removeMapSlot(long indexPos, byte[] keyHash, byte keyOffset) throws IOException {
+    private Slot removeMapSlot(long indexPos, byte[] keyHash, byte keyOffset, long frozenAt) throws IOException {
         if (keyOffset > (this.header.hashSize() * 8) / BIT_COUNT) {
             throw new KeyOffsetExceededException();
         }
@@ -2008,7 +2009,7 @@ public class Database {
         // get the slot that will replace the current slot
         var nextSlot = switch (slot.tag()) {
             case NONE -> throw new KeyNotFoundException();
-            case INDEX -> removeMapSlot(slot.value(), keyHash, (byte) (keyOffset + 1));
+            case INDEX -> removeMapSlot(slot.value(), keyHash, (byte) (keyOffset + 1), frozenAt);
             case KV_PAIR -> {
                 this.core.seek(slot.value());
                 var kvPairBytes = new byte[KeyValuePair.length(this.header.hashSize())];
@@ -2064,7 +2065,7 @@ public class Database {
         // there was more than one used slot, or a single INDEX slot,
         // so we must keep this index block. update the slot in it,
         // copying the block first unless it belongs to this transaction.
-        var nextIndexPos = copyIndexBlockIfOld(indexPos);
+        var nextIndexPos = copyIndexBlockIfOld(indexPos, frozenAt);
         this.core.seek(nextIndexPos + (Slot.length * i));
         writer.write(nextSlot.toBytes());
         return new Slot(nextIndexPos, Tag.INDEX);
@@ -2143,13 +2144,14 @@ public class Database {
     }
 
     // a node is safe to mutate in place when it was created in the current
-    // transaction (offset >= txStart), since no committed moment and no pre-concat
-    // sharing can reference it. concat advances txStart (an implicit freeze)
-    // precisely so its shared subtrees fall below it here.
-    private boolean btreeReusable(long ptr) throws IOException {
+    // transaction after the writing cursor's freeze point (see isOld), since
+    // no committed moment and no pre-concat sharing can reference it. concat
+    // advances txStart (an implicit freeze) precisely so its shared subtrees
+    // fall below it here.
+    private boolean btreeReusable(long ptr, long frozenAt) throws IOException {
         // nothing can be reused outside a transaction
         try {
-            return !isOld(ptr);
+            return !isOld(ptr, frozenAt);
         } catch (ExpectedTxStartException e) {
             return false;
         }
@@ -2157,8 +2159,8 @@ public class Database {
 
     // write a new version of a node, reusing oldPtr's position in place if that node
     // belongs to this transaction, otherwise appending a copy
-    private long btreeWriteNode(BTreeNode node, long oldPtr) throws IOException {
-        if (btreeReusable(oldPtr)) {
+    private long btreeWriteNode(BTreeNode node, long oldPtr, long frozenAt) throws IOException {
+        if (btreeReusable(oldPtr, frozenAt)) {
             writeBTreeNodeAt(node, oldPtr);
             return oldPtr;
         }
@@ -2195,7 +2197,7 @@ public class Database {
 
     // insert a placeholder slot at `rank` within the subtree at nodePtr, writing new
     // nodes along the path. the caller fills in the value at the returned valuePosition.
-    private BTreeInsertResult btreeInsert(long nodePtr, long rank) throws IOException {
+    private BTreeInsertResult btreeInsert(long nodePtr, long rank, long frozenAt) throws IOException {
         var node = readBTreeNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
@@ -2213,7 +2215,7 @@ public class Database {
                 if (total <= BTREE_SLOT_COUNT) {
                     var leaf = new BTreeNode(BTreeNodeKind.LEAF, total);
                     System.arraycopy(vals, 0, leaf.values, 0, total);
-                    var ptr = btreeWriteNode(leaf, nodePtr);
+                    var ptr = btreeWriteNode(leaf, nodePtr, frozenAt);
                     return new BTreeInsertResult(ptr, total, ptr + BTREE_NODE_HEADER_SIZE + (long) r * Slot.length, null);
                 }
 
@@ -2224,7 +2226,7 @@ public class Database {
                 System.arraycopy(vals, 0, left.values, 0, leftN);
                 var right = new BTreeNode(BTreeNodeKind.LEAF, rightN);
                 System.arraycopy(vals, leftN, right.values, 0, rightN);
-                var leftPtr = btreeWriteNode(left, nodePtr);
+                var leftPtr = btreeWriteNode(left, nodePtr, frozenAt);
                 var rightPtr = writeBTreeNode(right);
                 long valuePosition = (r < leftN)
                     ? leftPtr + BTREE_NODE_HEADER_SIZE + (long) r * Slot.length
@@ -2239,7 +2241,7 @@ public class Database {
                     rem -= node.counts[i];
                     i++;
                 }
-                var child = btreeInsert(node.children[i].value(), rem);
+                var child = btreeInsert(node.children[i].value(), rem, frozenAt);
 
                 // rebuild this branch with the (possibly split) child
                 var children = new Slot[BTREE_SLOT_COUNT + 1];
@@ -2263,7 +2265,7 @@ public class Database {
                     var branch = new BTreeNode(BTreeNodeKind.BRANCH, total);
                     System.arraycopy(children, 0, branch.children, 0, total);
                     System.arraycopy(counts, 0, branch.counts, 0, total);
-                    var ptr = btreeWriteNode(branch, nodePtr);
+                    var ptr = btreeWriteNode(branch, nodePtr, frozenAt);
                     return new BTreeInsertResult(ptr, branch.subtreeCount(), child.valuePosition(), null);
                 }
 
@@ -2276,7 +2278,7 @@ public class Database {
                 var right = new BTreeNode(BTreeNodeKind.BRANCH, rightN);
                 System.arraycopy(children, leftN, right.children, 0, rightN);
                 System.arraycopy(counts, leftN, right.counts, 0, rightN);
-                var leftPtr = btreeWriteNode(left, nodePtr);
+                var leftPtr = btreeWriteNode(left, nodePtr, frozenAt);
                 var rightPtr = writeBTreeNode(right);
                 return new BTreeInsertResult(leftPtr, left.subtreeCount(), child.valuePosition(),
                     new BTreeNodeRef(rightPtr, right.subtreeCount()));
@@ -2295,11 +2297,11 @@ public class Database {
     // that belong to a past transaction. the element count is unchanged, so when the
     // whole path is already this-transaction nothing is rewritten and the caller
     // writes straight into the existing leaf.
-    private BTreeWriteSlot btreeGetForWrite(long nodePtr, long rank) throws IOException {
+    private BTreeWriteSlot btreeGetForWrite(long nodePtr, long rank, long frozenAt) throws IOException {
         var node = readBTreeNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
-                var newPtr = btreeReusable(nodePtr) ? nodePtr : writeBTreeNode(node);
+                var newPtr = btreeReusable(nodePtr, frozenAt) ? nodePtr : writeBTreeNode(node);
                 return new BTreeWriteSlot(newPtr, newPtr + BTREE_NODE_HEADER_SIZE + rank * Slot.length, node.values[(int) rank]);
             }
             case BRANCH -> {
@@ -2309,13 +2311,13 @@ public class Database {
                     rem -= node.counts[i];
                     i++;
                 }
-                var child = btreeGetForWrite(node.children[i].value(), rem);
+                var child = btreeGetForWrite(node.children[i].value(), rem, frozenAt);
                 // if the child stayed put, this branch is unchanged too
                 if (child.nodePtr() == node.children[i].value()) {
                     return new BTreeWriteSlot(nodePtr, child.valuePosition(), child.slot());
                 }
                 node.children[i] = new Slot(child.nodePtr(), Tag.INDEX);
-                var newPtr = btreeWriteNode(node, nodePtr);
+                var newPtr = btreeWriteNode(node, nodePtr, frozenAt);
                 return new BTreeWriteSlot(newPtr, child.valuePosition(), child.slot());
             }
         }
@@ -2326,7 +2328,7 @@ public class Database {
     // node left behind for the caller to write. an emptied child is dropped and a
     // child left under half full is merged with a neighbor it fits with, so every
     // leaf stays at the same depth.
-    private BTreeNode btreeRemove(long nodePtr, long rank) throws IOException {
+    private BTreeNode btreeRemove(long nodePtr, long rank, long frozenAt) throws IOException {
         var node = readBTreeNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
@@ -2343,7 +2345,7 @@ public class Database {
                     i++;
                 }
                 var childPtr = node.children[i].value();
-                var child = btreeRemove(childPtr, rem);
+                var child = btreeRemove(childPtr, rem, frozenAt);
                 if (child.num == 0) {
                     btreeDropChild(node, i);
                     return node;
@@ -2358,7 +2360,7 @@ public class Database {
                         i = first;
                     }
                 }
-                node.children[i] = new Slot(btreeWriteNode(child, childPtr), Tag.INDEX);
+                node.children[i] = new Slot(btreeWriteNode(child, childPtr, frozenAt), Tag.INDEX);
                 node.counts[i] = child.subtreeCount();
             }
         }
@@ -2579,7 +2581,7 @@ public class Database {
 
     public static record ArrayListAppendResult(ArrayListHeader header, SlotPointer slotPtr) {}
 
-    private ArrayListAppendResult readArrayListSlotAppend(ArrayListHeader header, WriteMode writeMode) throws IOException {
+    private ArrayListAppendResult readArrayListSlotAppend(ArrayListHeader header, WriteMode writeMode, long frozenAt) throws IOException {
         var writer = this.core.writer();
 
         var indexPos = header.ptr();
@@ -2599,7 +2601,7 @@ public class Database {
             indexPos = nextIndexPos;
         }
 
-        var slotPtr = readArrayListSlot(indexPos, key, nextShift, writeMode);
+        var slotPtr = readArrayListSlot(indexPos, key, nextShift, writeMode, frozenAt);
         // clear values left by a rollback or slice
         slotPtr = slotPtr.withSlot(new Slot());
         this.core.seek(slotPtr.position());
@@ -2607,7 +2609,7 @@ public class Database {
         return new ArrayListAppendResult(new ArrayListHeader(indexPos, header.size() + 1), slotPtr);
     }
 
-    private SlotPointer readArrayListSlot(long indexPos, long key, byte shift, WriteMode writeMode) throws IOException {
+    private SlotPointer readArrayListSlot(long indexPos, long key, byte shift, WriteMode writeMode, long frozenAt) throws IOException {
         if (shift >= MAX_BRANCH_LENGTH) throw new MaxShiftExceededException();
 
         var reader = this.core.reader();
@@ -2636,7 +2638,7 @@ public class Database {
                         writer.write(new byte[INDEX_BLOCK_SIZE]);
                         this.core.seek(slotPos);
                         writer.write(new Slot(nextIndexPos, Tag.INDEX).toBytes());
-                        return readArrayListSlot(nextIndexPos, key, (byte)(shift - 1), writeMode);
+                        return readArrayListSlot(nextIndexPos, key, (byte)(shift - 1), writeMode, frozenAt);
                     }
                     default -> throw new UnreachableException();
                 }
@@ -2644,7 +2646,7 @@ public class Database {
             case INDEX -> {
                 var nextPtr = ptr;
                 if (writeMode == WriteMode.READ_WRITE) {
-                    nextPtr = copyIndexBlockIfOld(ptr);
+                    nextPtr = copyIndexBlockIfOld(ptr, frozenAt);
                     if (nextPtr != ptr) {
                         // make slot point to the copied block
                         var writer = this.core.writer();
@@ -2652,13 +2654,13 @@ public class Database {
                         writer.write(new Slot(nextPtr, Tag.INDEX).toBytes());
                     }
                 }
-                return readArrayListSlot(nextPtr, key, (byte)(shift - 1), writeMode);
+                return readArrayListSlot(nextPtr, key, (byte)(shift - 1), writeMode, frozenAt);
             }
             default -> throw new UnexpectedTagException();
         }
     }
 
-    private ArrayListHeader readArrayListSlice(ArrayListHeader header, long size) throws IOException {
+    private ArrayListHeader readArrayListSlice(ArrayListHeader header, long size, long frozenAt) throws IOException {
         var reader = this.core.reader();
 
         if (size > header.size() || size < 0) {
@@ -2685,7 +2687,7 @@ public class Database {
             }
             // the new root may still belong to a past moment. unlike child
             // nodes, root nodes are written directly, so copy it now.
-            indexPos = copyIndexBlockIfOld(indexPos);
+            indexPos = copyIndexBlockIfOld(indexPos, frozenAt);
             return new ArrayListHeader(indexPos, size);
         }
     }
@@ -2766,8 +2768,8 @@ public class Database {
 
     // reuse oldPtr's position in place when it belongs to this transaction
     // (mirrors btreeWriteNode / the txStart path-copying model)
-    private long sortedWriteNode(SortedNode node, long oldPtr) throws IOException {
-        if (btreeReusable(oldPtr)) {
+    private long sortedWriteNode(SortedNode node, long oldPtr, long frozenAt) throws IOException {
+        if (btreeReusable(oldPtr, frozenAt)) {
             writeSortedNodeAt(node, oldPtr);
             return oldPtr;
         }
@@ -2957,7 +2959,7 @@ public class Database {
     // insert key (or locate it for replacement) within the subtree at nodePtr,
     // path-copying nodes and maintaining separators + counts. the caller writes the
     // value of the returned entry.
-    private SortedInsertResult sortedPut(long nodePtr, byte[] key) throws IOException {
+    private SortedInsertResult sortedPut(long nodePtr, byte[] key, long frozenAt) throws IOException {
         var node = readSortedNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
@@ -2976,11 +2978,11 @@ public class Database {
                     // kv_pair if it belongs to a past moment
                     var leaf = node;
                     var kvSlot = node.entries[idx];
-                    if (!btreeReusable(kvSlot.value())) {
+                    if (!btreeReusable(kvSlot.value(), frozenAt)) {
                         kvSlot = writeKvPair(kvSlot.tag(), readKvPair(kvSlot));
                         leaf.entries[idx] = kvSlot;
                     }
-                    var ptr = sortedWriteNode(leaf, nodePtr);
+                    var ptr = sortedWriteNode(leaf, nodePtr, frozenAt);
                     return new SortedInsertResult(ptr, node.num, kvSlot, false, null);
                 }
 
@@ -2996,7 +2998,7 @@ public class Database {
                 if (total <= BTREE_SLOT_COUNT) {
                     var leaf = new SortedNode(BTreeNodeKind.LEAF, total);
                     System.arraycopy(entries, 0, leaf.entries, 0, total);
-                    var ptr = sortedWriteNode(leaf, nodePtr);
+                    var ptr = sortedWriteNode(leaf, nodePtr, frozenAt);
                     return new SortedInsertResult(ptr, total, entry.kvSlot(), true, null);
                 }
 
@@ -3009,14 +3011,14 @@ public class Database {
                 var right = new SortedNode(BTreeNodeKind.LEAF, rightN);
                 System.arraycopy(entries, leftN, right.entries, 0, rightN);
                 var separator = readKvPair(entries[leftN]).keySlot();
-                var leftPtr = sortedWriteNode(left, nodePtr);
+                var leftPtr = sortedWriteNode(left, nodePtr, frozenAt);
                 var rightPtr = writeSortedNode(right);
                 return new SortedInsertResult(leftPtr, leftN, entry.kvSlot(), true, new SortedSplit(rightPtr, rightN, separator));
             }
             case BRANCH -> {
                 int i = 0;
                 while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
-                var child = sortedPut(node.children[i].value(), key);
+                var child = sortedPut(node.children[i].value(), key, frozenAt);
 
                 var children = new Slot[BTREE_SLOT_COUNT + 1];
                 var separators = new Slot[BTREE_SLOT_COUNT + 1];
@@ -3046,7 +3048,7 @@ public class Database {
                     System.arraycopy(children, 0, branch.children, 0, total);
                     System.arraycopy(separators, 0, branch.separators, 0, total);
                     System.arraycopy(counts, 0, branch.counts, 0, total);
-                    var ptr = sortedWriteNode(branch, nodePtr);
+                    var ptr = sortedWriteNode(branch, nodePtr, frozenAt);
                     return new SortedInsertResult(ptr, branch.subtreeCount(), child.kvSlot(), child.added(), null);
                 }
 
@@ -3063,7 +3065,7 @@ public class Database {
                 System.arraycopy(separators, leftN, right.separators, 0, rightN);
                 System.arraycopy(counts, leftN, right.counts, 0, rightN);
                 var separator = separators[leftN];
-                var leftPtr = sortedWriteNode(left, nodePtr);
+                var leftPtr = sortedWriteNode(left, nodePtr, frozenAt);
                 var rightPtr = writeSortedNode(right);
                 return new SortedInsertResult(leftPtr, left.subtreeCount(), child.kvSlot(), child.added(), new SortedSplit(rightPtr, right.subtreeCount(), separator));
             }
@@ -3073,7 +3075,7 @@ public class Database {
 
     // remove key from the subtree at nodePtr, path-copying nodes and decrementing
     // counts. an emptied leaf is left in place (see SortedRemoveResult).
-    private SortedRemoveResult sortedRemove(long nodePtr, byte[] key) throws IOException {
+    private SortedRemoveResult sortedRemove(long nodePtr, byte[] key, long frozenAt) throws IOException {
         var node = readSortedNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
@@ -3090,19 +3092,19 @@ public class Database {
                 var leaf = new SortedNode(BTreeNodeKind.LEAF, node.num - 1);
                 System.arraycopy(node.entries, 0, leaf.entries, 0, idx);
                 System.arraycopy(node.entries, idx + 1, leaf.entries, idx, node.num - 1 - idx);
-                var ptr = sortedWriteNode(leaf, nodePtr);
+                var ptr = sortedWriteNode(leaf, nodePtr, frozenAt);
                 return new SortedRemoveResult(ptr, true);
             }
             case BRANCH -> {
                 int i = 0;
                 while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
-                var child = sortedRemove(node.children[i].value(), key);
+                var child = sortedRemove(node.children[i].value(), key, frozenAt);
                 if (!child.found()) return new SortedRemoveResult(nodePtr, false);
 
                 var branch = node;
                 branch.children[i] = new Slot(child.nodePtr(), Tag.INDEX);
                 branch.counts[i] -= 1;
-                var ptr = sortedWriteNode(branch, nodePtr);
+                var ptr = sortedWriteNode(branch, nodePtr, frozenAt);
                 return new SortedRemoveResult(ptr, true);
             }
         }

@@ -849,13 +849,15 @@ class HighLevelDatabaseTest {
                 bigCities.append(new Database.Bytes("New York, NY"));
                 bigCities.append(new Database.Bytes("Los Angeles, CA"));
 
-                // freeze here, so big-cities won't be mutated
-                cursor.db.freeze();
-
                 // create a new key called "cities" whose initial value is
                 // based on the "big-cities" list
                 var citiesCursor = moment.putCursor("cities");
                 citiesCursor.write(bigCities.slot());
+
+                // freeze here, so writes to cities won't mutate big-cities
+                // note: you can also freeze globally with `cursor.db.freeze()`,
+                // but call it before `putCursor` creates the cities cursor
+                citiesCursor.freeze();
 
                 var cities = new WriteArrayList(citiesCursor);
                 cities.append(new Database.Bytes("Charleston, SC"));
