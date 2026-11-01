@@ -36,7 +36,6 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     SlotPointer resolved() throws IOException {
         if (Database.isRoot(this.slotPtr)) {
             var header = this.db.readRootHeader();
-            if (header.fileSize() < Database.RootTrailer.length) throw new Database.InvalidDatabaseException();
             // the root slot is the first thing in the trailer
             return new SlotPointer(header.fileSize() - Database.RootTrailer.length, header.root());
         }
