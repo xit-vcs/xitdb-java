@@ -62,7 +62,7 @@ public class Database {
     public static final int BTREE_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
     public static final int BTREE_BRANCH_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + (Slot.length + 8) * BTREE_SLOT_COUNT;
     // sorted_map / sorted_set node block: [kind: u8][num: u8] followed by, for a
-    // leaf, BTREE_SLOT_COUNT .sorted_kv_pair slots; for a branch, BTREE_SLOT_COUNT
+    // leaf, BTREE_SLOT_COUNT entry slots (see readKvPair); for a branch, BTREE_SLOT_COUNT
     // child slots, then BTREE_SLOT_COUNT separator slots, then BTREE_SLOT_COUNT
     // u64 counts
     public static final int SORTED_LEAF_BLOCK_SIZE = BTREE_NODE_HEADER_SIZE + Slot.length * BTREE_SLOT_COUNT;
@@ -877,9 +877,21 @@ public class Database {
         }
     }
 
-    // where the key slot is in a .kv_pair or .sorted_kv_pair entry. the value slot follows it.
-    long kvKeyOffset(Tag tag) {
-        return tag == Tag.KV_PAIR ? this.header.hashSize() : 0;
+    static boolean isKeyOnlyEntry(Slot entry) {
+        return entry.tag() == Tag.BYTES || entry.tag() == Tag.SHORT_BYTES;
+    }
+
+    // where a key-value entry's key slot is. a key-only entry has no separate slot.
+    Long kvKeyPosition(Slot entry) {
+        if (isKeyOnlyEntry(entry)) return null;
+        return entry.value() + (entry.tag() == Tag.KV_PAIR ? this.header.hashSize() : 0);
+    }
+
+    // where a key-value entry's value slot is. it follows the key slot.
+    Long kvValuePosition(Slot entry) {
+        var keyPosition = kvKeyPosition(entry);
+        if (keyPosition == null) return null;
+        return keyPosition + Slot.length;
     }
 
     // header for both B+trees (the positional linked_array_list and the sorted
@@ -942,7 +954,7 @@ public class Database {
     // sorted_map / sorted_set: a count-augmented B+tree keyed on arbitrary byte
     // strings, ordered lexicographically. reuses the b-tree's capacity constants,
     // persistence model (txStart reuse), and the BTreeHeader {rootPtr, size}
-    // header. a leaf holds .sorted_kv_pair entries in ascending key order;
+    // header. a leaf holds entries (see readKvPair) in ascending key order;
     // a branch holds child slots, separator slots (the smallest key in each child's
     // subtree; separators[0] is an unused sentinel), and per-child subtree counts.
     public static final class SortedNode {
@@ -974,9 +986,9 @@ public class Database {
     // the new right sibling produced when a node splits
     public static record SortedSplit(long nodePtr, long count, Slot separator) {}
 
-    // insert/replace result: the entry whose value to write, whether a new entry
+    // insert/replace result: the entry to read or write, whether a new entry
     // was added (vs replacing), and the new right sibling if this node split
-    public static record SortedInsertResult(long nodePtr, long count, Slot kvSlot, boolean added, SortedSplit split) {}
+    public static record SortedInsertResult(long nodePtr, long count, Slot entry, boolean added, SortedSplit split) {}
 
     // remove result threaded back up the descent: the rewritten node and whether the
     // key was found. separators are stable lower-bound boundaries (not exact mins), so
@@ -984,8 +996,6 @@ public class Database {
     public static record SortedRemoveResult(long nodePtr, boolean found) {}
 
     public static record SortedSlot(Slot slot, long position) {}
-
-    public static record SortedEntry(Slot kvSlot, Slot keySlot) {}
 
     public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, SortedMapInit, SortedMapGet, SortedMapGetIndex, SortedMapRemove, WriteData, Context {
         public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception;
@@ -1562,7 +1572,6 @@ public class Database {
                     return db.readSlotPointer(writeMode, path, pathI + 1, nextSlotPtr, frozenAt);
                 }
                 case SORTED_MAP, SORTED_SET -> {
-                    if (slotPtr.slot().tag() != tag) throw new UnexpectedTagException();
                     var headerPtr = slotPtr.slot().value();
                     // copy the header into this transaction unless it was made in it
                     if (db.isOld(headerPtr, frozenAt)) {
@@ -1612,7 +1621,9 @@ public class Database {
                 var targetSlot = db.sortedTargetSlot(found.slot(), this.target());
                 return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
             } else {
-                var result = db.sortedPut(header.rootPtr(), key, frozenAt);
+                // only a set that is just touching the key can leave out the value
+                var keyOnly = slotPtr.slot().tag() == Tag.SORTED_SET && this.target() instanceof SortedMapGetKey;
+                var result = db.sortedPut(header.rootPtr(), key, keyOnly, frozenAt);
                 var newRootPtr = db.sortedGrowRoot(result);
 
                 // update the header before filling in the value, so that a failure in
@@ -1622,7 +1633,7 @@ public class Database {
                 db.core.seek(headerPtr);
                 writer.write(new BTreeHeader(newRootPtr, header.size() + (result.added() ? 1 : 0)).toBytes());
 
-                var targetSlot = db.sortedTargetSlot(result.kvSlot(), this.target());
+                var targetSlot = db.sortedTargetSlot(result.entry(), this.target());
                 return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
             }
         }
@@ -2805,9 +2816,17 @@ public class Database {
         }
     }
 
-    KeyValuePair readKvPair(Slot kvSlot) throws IOException {
-        this.core.seek(kvSlot.value());
-        return decodeKvPair(this.core.reader(), kvSlot.tag(), this.header.hashSize());
+    // reads a key-value entry, which is one of these:
+    // 1. a .bytes or .short_bytes slot: the key by itself, stored directly in a
+    //    sorted set's leaf. it has no value slot, so its value is empty.
+    // 2. a .kv_pair or .sorted_kv_pair slot: a pointer to the key and value.
+    // sorted maps and sets can be reinterpreted as each other, so one leaf can
+    // contain both. always look at the entry's tag, not the container's. a cursor
+    // doesn't know its container, so any bytes can be read as a key-only entry.
+    KeyValuePair readKvPair(Slot entry) throws IOException {
+        if (isKeyOnlyEntry(entry)) return new KeyValuePair(new Slot(), entry, new byte[this.header.hashSize()]);
+        this.core.seek(entry.value());
+        return decodeKvPair(this.core.reader(), entry.tag(), this.header.hashSize());
     }
 
     // writes a .kv_pair or .sorted_kv_pair entry at the end and returns its slot
@@ -2949,19 +2968,18 @@ public class Database {
         return new Slot(pos, Tag.BYTES);
     }
 
-    // materialize a new leaf entry: write the key bytes and a key-value pair with
-    // an empty value (the caller fills it in). navigation is by key bytes, so the
-    // entry has no hash.
-    private SortedEntry sortedNewEntry(byte[] key) throws IOException {
-        var keySlot = writeKey(key);
-        var kvSlot = writeKvPair(Tag.SORTED_KV_PAIR, new KeyValuePair(new Slot(), keySlot, new byte[this.header.hashSize()]));
-        return new SortedEntry(kvSlot, keySlot);
+    // wraps a key slot in a new key-value pair with an empty value (the caller
+    // fills it in). navigation is by key bytes, so the pair has no hash.
+    private Slot writeSortedPair(Slot keySlot) throws IOException {
+        return writeKvPair(Tag.SORTED_KV_PAIR, new KeyValuePair(new Slot(), keySlot, new byte[this.header.hashSize()]));
     }
 
     // insert key (or locate it for replacement) within the subtree at nodePtr,
     // path-copying nodes and maintaining separators + counts. the caller writes the
-    // value of the returned entry.
-    private SortedInsertResult sortedPut(long nodePtr, byte[] key, long frozenAt) throws IOException {
+    // value of the returned entry, unless keyOnly is true. in that case, a new key
+    // is stored as a key-only entry, and an existing entry is left alone. otherwise,
+    // the returned entry is a key-value pair with a writeable value.
+    private SortedInsertResult sortedPut(long nodePtr, byte[] key, boolean keyOnly, long frozenAt) throws IOException {
         var node = readSortedNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
@@ -2976,24 +2994,29 @@ public class Database {
                 }
 
                 if (found) {
-                    // replace: return a writable value slot, copy-on-writing the
-                    // kv_pair if it belongs to a past moment
+                    if (keyOnly) return new SortedInsertResult(nodePtr, node.num, node.entries[idx], false, null);
+
+                    // replace: return a writable value slot, moving a key-only entry
+                    // into a pair or copy-on-writing a pair from a past moment
                     var leaf = node;
-                    var kvSlot = node.entries[idx];
-                    if (!btreeReusable(kvSlot.value(), frozenAt)) {
-                        kvSlot = writeKvPair(kvSlot.tag(), readKvPair(kvSlot));
-                        leaf.entries[idx] = kvSlot;
+                    var entry = node.entries[idx];
+                    if (isKeyOnlyEntry(entry)) {
+                        entry = writeSortedPair(entry);
+                    } else if (!btreeReusable(entry.value(), frozenAt)) {
+                        entry = writeKvPair(entry.tag(), readKvPair(entry));
                     }
+                    leaf.entries[idx] = entry;
                     var ptr = sortedWriteNode(leaf, nodePtr, frozenAt);
-                    return new SortedInsertResult(ptr, node.num, kvSlot, false, null);
+                    return new SortedInsertResult(ptr, node.num, entry, false, null);
                 }
 
                 // insert a new entry at idx
-                var entry = sortedNewEntry(key);
+                var keySlot = writeKey(key);
+                var entry = keyOnly ? keySlot : writeSortedPair(keySlot);
                 var entries = new Slot[BTREE_SLOT_COUNT + 1];
                 for (int i = 0; i < entries.length; i++) entries[i] = new Slot();
                 System.arraycopy(node.entries, 0, entries, 0, idx);
-                entries[idx] = entry.kvSlot();
+                entries[idx] = entry;
                 System.arraycopy(node.entries, idx, entries, idx + 1, node.num - idx);
                 int total = node.num + 1;
 
@@ -3001,7 +3024,7 @@ public class Database {
                     var leaf = new SortedNode(BTreeNodeKind.LEAF, total);
                     System.arraycopy(entries, 0, leaf.entries, 0, total);
                     var ptr = sortedWriteNode(leaf, nodePtr, frozenAt);
-                    return new SortedInsertResult(ptr, total, entry.kvSlot(), true, null);
+                    return new SortedInsertResult(ptr, total, entry, true, null);
                 }
 
                 // overflow: split into two leaves; the new sibling's separator is the
@@ -3015,12 +3038,16 @@ public class Database {
                 var separator = readKvPair(entries[leftN]).keySlot();
                 var leftPtr = sortedWriteNode(left, nodePtr, frozenAt);
                 var rightPtr = writeSortedNode(right);
-                return new SortedInsertResult(leftPtr, leftN, entry.kvSlot(), true, new SortedSplit(rightPtr, rightN, separator));
+                return new SortedInsertResult(leftPtr, leftN, entry, true, new SortedSplit(rightPtr, rightN, separator));
             }
             case BRANCH -> {
                 int i = 0;
                 while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
-                var child = sortedPut(node.children[i].value(), key, frozenAt);
+                var child = sortedPut(node.children[i].value(), key, keyOnly, frozenAt);
+                // nothing below changed, so don't copy this node for no reason
+                if (!child.added() && child.nodePtr() == node.children[i].value()) {
+                    return new SortedInsertResult(nodePtr, node.subtreeCount(), child.entry(), false, null);
+                }
 
                 var children = new Slot[BTREE_SLOT_COUNT + 1];
                 var separators = new Slot[BTREE_SLOT_COUNT + 1];
@@ -3051,7 +3078,7 @@ public class Database {
                     System.arraycopy(separators, 0, branch.separators, 0, total);
                     System.arraycopy(counts, 0, branch.counts, 0, total);
                     var ptr = sortedWriteNode(branch, nodePtr, frozenAt);
-                    return new SortedInsertResult(ptr, branch.subtreeCount(), child.kvSlot(), child.added(), null);
+                    return new SortedInsertResult(ptr, branch.subtreeCount(), child.entry(), child.added(), null);
                 }
 
                 // overflow: split into two branches; the new sibling's separator is the
@@ -3069,7 +3096,7 @@ public class Database {
                 var separator = separators[leftN];
                 var leftPtr = sortedWriteNode(left, nodePtr, frozenAt);
                 var rightPtr = writeSortedNode(right);
-                return new SortedInsertResult(leftPtr, left.subtreeCount(), child.kvSlot(), child.added(), new SortedSplit(rightPtr, right.subtreeCount(), separator));
+                return new SortedInsertResult(leftPtr, left.subtreeCount(), child.entry(), child.added(), new SortedSplit(rightPtr, right.subtreeCount(), separator));
             }
         }
         throw new UnreachableException();
@@ -3130,14 +3157,13 @@ public class Database {
     // turn a located/inserted entry into the slot for the requested target. only
     // the value is writeable (that is how put works); the key and the entry
     // pointer are immutable, so they are returned with no writeable position.
-    private SlotPointer sortedTargetSlot(Slot kvSlot, SortedMapGetTarget target) throws IOException {
-        var kv = readKvPair(kvSlot);
+    private SlotPointer sortedTargetSlot(Slot entry, SortedMapGetTarget target) throws IOException {
         if (target instanceof SortedMapGetKVPair) {
-            return new SlotPointer(null, kvSlot);
+            return new SlotPointer(null, entry);
         } else if (target instanceof SortedMapGetKey) {
-            return new SlotPointer(null, kv.keySlot());
+            return new SlotPointer(null, readKvPair(entry).keySlot());
         } else if (target instanceof SortedMapGetValue) {
-            return new SlotPointer(kvSlot.value() + kvKeyOffset(kvSlot.tag()) + Slot.length, kv.valueSlot());
+            return new SlotPointer(kvValuePosition(entry), readKvPair(entry).valueSlot());
         } else {
             throw new IllegalArgumentException();
         }

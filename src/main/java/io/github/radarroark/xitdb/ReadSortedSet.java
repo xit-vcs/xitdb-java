@@ -2,7 +2,8 @@ package io.github.radarroark.xitdb;
 
 import java.io.IOException;
 
-// a sorted set of byte-string keys (a SortedMap with no values).
+// a sorted set of byte-string keys (a SortedMap with no values). keys are
+// stored directly in the leaves, which avoids a key-value pair per entry.
 public class ReadSortedSet implements Slotted, Iterable<ReadCursor> {
     public ReadCursor cursor;
 
