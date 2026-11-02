@@ -45,6 +45,14 @@ public class WriteLinkedArrayList extends ReadLinkedArrayList {
         });
     }
 
+    public void appendContext(Database.WriteableData data, Database.ContextFunction fn) throws Exception {
+        ((WriteCursor)this.cursor).writePath(new Database.PathPart[]{
+            new Database.LinkedArrayListAppend(),
+            new Database.WriteData(data),
+            new Database.Context(fn)
+        });
+    }
+
     public void slice(long offset, long size) throws Exception {
         ((WriteCursor)this.cursor).writePath(new Database.PathPart[]{
             new Database.LinkedArrayListSlice(offset, size)
