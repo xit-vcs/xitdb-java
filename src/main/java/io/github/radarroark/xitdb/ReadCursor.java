@@ -567,18 +567,14 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 var position = nodePtr + Database.BTREE_NODE_HEADER_SIZE;
                 switch (node.kind) {
                     case LEAF -> {
-                        int li = node.num;
-                        for (int j = 0; j < node.num; j++) {
-                            var kv = cursor.db.readKvPair(node.entries[j]);
-                            if (cursor.db.compareKey(kv.keySlot(), key) >= 0) { li = j; break; }
-                        }
+                        int li = cursor.db.sortedLeafSearch(node, key).index();
                         before += li;
                         stack.add(new Level(position, node.entries, (byte) li));
                         return new SortedStackResult(stack, before);
                     }
                     case BRANCH -> {
-                        int i = 0;
-                        while (i + 1 < node.num && cursor.db.compareKey(node.separators[i + 1], key) <= 0) { before += node.counts[i]; i++; }
+                        int i = cursor.db.sortedBranchSearch(node, key);
+                        for (int k = 0; k < i; k++) before += node.counts[k];
                         stack.add(new Level(position, node.children, (byte) i));
                         nodePtr = node.children[i].value();
                     }

@@ -997,6 +997,8 @@ public class Database {
 
     public static record SortedSlot(Slot slot, long position) {}
 
+    static record SortedLeafSearch(int index, boolean found) {}
+
     public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, SortedMapInit, SortedMapGet, SortedMapGetIndex, SortedMapRemove, WriteData, Context {
         public SlotPointer readSlotPointer(Database db, WriteMode writeMode, PathPart[] path, int pathI, SlotPointer slotPtr, long frozenAt) throws Exception;
     }
@@ -2878,6 +2880,37 @@ public class Database {
         }
     }
 
+    // binary search for the child whose subtree may contain key: the last child
+    // whose separator is <= key, or the first child if there is none. separators[0]
+    // is an unused sentinel, so it is never compared.
+    int sortedBranchSearch(SortedNode node, byte[] key) throws IOException {
+        int lo = 1;
+        int hi = node.num;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (compareKey(node.separators[mid], key) <= 0) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo - 1;
+    }
+
+    // binary search for key among a leaf's entries. if it isn't found, the index is
+    // where it would be inserted. since keys are unique, the index is the number of
+    // entries less than key either way.
+    SortedLeafSearch sortedLeafSearch(SortedNode node, byte[] key) throws IOException {
+        int lo = 0;
+        int hi = node.num;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            var kv = readKvPair(node.entries[mid]);
+            int cmp = compareKey(kv.keySlot(), key);
+            if (cmp == 0) return new SortedLeafSearch(mid, true);
+            if (cmp < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        return new SortedLeafSearch(lo, false);
+    }
+
     // descend by key to the matching leaf entry, or null
     private SortedSlot sortedGet(long rootPtr, byte[] key) throws IOException {
         var nodePtr = rootPtr;
@@ -2885,18 +2918,12 @@ public class Database {
             var node = readSortedNode(nodePtr);
             switch (node.kind) {
                 case LEAF -> {
-                    for (int i = 0; i < node.num; i++) {
-                        var entry = node.entries[i];
-                        var kv = readKvPair(entry);
-                        int cmp = compareKey(kv.keySlot(), key);
-                        if (cmp == 0) return new SortedSlot(entry, nodePtr + BTREE_NODE_HEADER_SIZE + (long) i * Slot.length);
-                        if (cmp > 0) return null;
-                    }
-                    return null;
+                    var search = sortedLeafSearch(node, key);
+                    if (!search.found()) return null;
+                    return new SortedSlot(node.entries[search.index()], nodePtr + BTREE_NODE_HEADER_SIZE + (long) search.index() * Slot.length);
                 }
                 case BRANCH -> {
-                    int i = 0;
-                    while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
+                    int i = sortedBranchSearch(node, key);
                     nodePtr = node.children[i].value();
                 }
             }
@@ -2931,16 +2958,11 @@ public class Database {
             var node = readSortedNode(nodePtr);
             switch (node.kind) {
                 case LEAF -> {
-                    for (int i = 0; i < node.num; i++) {
-                        var kv = readKvPair(node.entries[i]);
-                        if (compareKey(kv.keySlot(), key) < 0) rank += 1;
-                        else break;
-                    }
-                    return rank;
+                    return rank + sortedLeafSearch(node, key).index();
                 }
                 case BRANCH -> {
-                    int i = 0;
-                    while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) { rank += node.counts[i]; i++; }
+                    int i = sortedBranchSearch(node, key);
+                    for (int k = 0; k < i; k++) rank += node.counts[k];
                     nodePtr = node.children[i].value();
                 }
             }
@@ -2984,16 +3006,10 @@ public class Database {
         switch (node.kind) {
             case LEAF -> {
                 // find the matching or insertion index
-                int idx = node.num;
-                boolean found = false;
-                for (int i = 0; i < node.num; i++) {
-                    var kv = readKvPair(node.entries[i]);
-                    int cmp = compareKey(kv.keySlot(), key);
-                    if (cmp == 0) { idx = i; found = true; break; }
-                    if (cmp > 0) { idx = i; break; }
-                }
+                var search = sortedLeafSearch(node, key);
+                int idx = search.index();
 
-                if (found) {
+                if (search.found()) {
                     if (keyOnly) return new SortedInsertResult(nodePtr, node.num, node.entries[idx], false, null);
 
                     // replace: return a writable value slot, moving a key-only entry
@@ -3041,8 +3057,7 @@ public class Database {
                 return new SortedInsertResult(leftPtr, leftN, entry, true, new SortedSplit(rightPtr, rightN, separator));
             }
             case BRANCH -> {
-                int i = 0;
-                while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
+                int i = sortedBranchSearch(node, key);
                 var child = sortedPut(node.children[i].value(), key, keyOnly, frozenAt);
                 // nothing below changed, so don't copy this node for no reason
                 if (!child.added() && child.nodePtr() == node.children[i].value()) {
@@ -3108,15 +3123,9 @@ public class Database {
         var node = readSortedNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
-                int idx = node.num;
-                boolean found = false;
-                for (int i = 0; i < node.num; i++) {
-                    var kv = readKvPair(node.entries[i]);
-                    int cmp = compareKey(kv.keySlot(), key);
-                    if (cmp == 0) { idx = i; found = true; break; }
-                    if (cmp > 0) break;
-                }
-                if (!found) return new SortedRemoveResult(nodePtr, false);
+                var search = sortedLeafSearch(node, key);
+                if (!search.found()) return new SortedRemoveResult(nodePtr, false);
+                int idx = search.index();
 
                 var leaf = new SortedNode(BTreeNodeKind.LEAF, node.num - 1);
                 System.arraycopy(node.entries, 0, leaf.entries, 0, idx);
@@ -3125,8 +3134,7 @@ public class Database {
                 return new SortedRemoveResult(ptr, true);
             }
             case BRANCH -> {
-                int i = 0;
-                while (i + 1 < node.num && compareKey(node.separators[i + 1], key) <= 0) i++;
+                int i = sortedBranchSearch(node, key);
                 var child = sortedRemove(node.children[i].value(), key, frozenAt);
                 if (!child.found()) return new SortedRemoveResult(nodePtr, false);
 
