@@ -995,8 +995,6 @@ public class Database {
     // deletions never refresh them; an emptied leaf is left in place.
     public static record SortedRemoveResult(long nodePtr, boolean found) {}
 
-    public static record SortedSlot(Slot slot, long position) {}
-
     static record SortedLeafSearch(int index, boolean found) {}
 
     public static sealed interface PathPart permits ArrayListInit, ArrayListGet, ArrayListAppend, ArrayListSlice, LinkedArrayListInit, LinkedArrayListGet, LinkedArrayListAppend, LinkedArrayListSlice, LinkedArrayListConcat, LinkedArrayListInsert, LinkedArrayListRemove, HashMapInit, HashMapGet, HashMapRemove, SortedMapInit, SortedMapGet, SortedMapGetIndex, SortedMapRemove, WriteData, Context {
@@ -1221,7 +1219,7 @@ public class Database {
             var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
             if (writeMode == WriteMode.READ_ONLY) {
-                var finalSlotPtr = db.readBTreeSlot(header.rootPtr(), rank);
+                var finalSlotPtr = db.descendByRank(header.rootPtr(), rank, BTREE_BRANCH_BLOCK_SIZE);
                 return db.readSlotPointer(writeMode, path, pathI + 1, finalSlotPtr, frozenAt);
             } else {
                 // path-copy down to the value slot so the write is persistent
@@ -1618,9 +1616,9 @@ public class Database {
             var header = BTreeHeader.fromBytes(headerBytes);
 
             if (writeMode == WriteMode.READ_ONLY) {
-                var found = db.sortedGet(header.rootPtr(), key);
-                if (found == null) throw new KeyNotFoundException();
-                var targetSlot = db.sortedTargetSlot(found.slot(), this.target());
+                var entry = db.sortedGet(header.rootPtr(), key);
+                if (entry == null) throw new KeyNotFoundException();
+                var targetSlot = db.sortedTargetSlot(entry, this.target());
                 return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
             } else {
                 // only a set that is just touching the key can leave out the value
@@ -1664,9 +1662,8 @@ public class Database {
             }
             var rank = index < 0 ? header.size() - Math.abs(index) : index;
 
-            var found = db.sortedGetByIndex(header.rootPtr(), rank);
             // return the entry so the caller can read key and value
-            var targetSlot = new SlotPointer(found.position(), found.slot());
+            var targetSlot = db.descendByRank(header.rootPtr(), rank, SORTED_BRANCH_BLOCK_SIZE);
             return db.readSlotPointer(writeMode, path, pathI + 1, targetSlot, frozenAt);
         }
     }
@@ -2186,27 +2183,52 @@ public class Database {
         return writeBTreeNode(new BTreeNode(BTreeNodeKind.LEAF, 0));
     }
 
-    // descend to the value slot at the given rank (0-based), returning a pointer
-    // to it (its file position and current slot).
-    private SlotPointer readBTreeSlot(long rootPtr, long rank) throws IOException {
+    // descend to the slot at the given rank (0-based), decoding only the counts
+    // and slot needed from each node. linked array lists and sorted maps/sets share
+    // this because their leaves are identical and their branches start with the
+    // children and end with the counts, so only the size differs.
+    private SlotPointer descendByRank(long rootPtr, long rank, int branchBlockSize) throws IOException {
+        int countsPos = branchBlockSize - BTREE_SLOT_COUNT * 8;
+        var block = new byte[branchBlockSize];
+        var buffer = ByteBuffer.wrap(block);
+        var reader = this.core.reader();
+        long length = this.core.length();
         var nodePtr = rootPtr;
         var rem = rank;
         while (true) {
-            var node = readBTreeNode(nodePtr);
-            switch (node.kind) {
+            // a leaf may be at the end of the db, so there may not be a whole
+            // branch's worth of bytes to read
+            int size = (int) Math.min(branchBlockSize, length - nodePtr);
+            if (size < BTREE_LEAF_BLOCK_SIZE) throw new EndOfStreamException();
+            this.core.seek(nodePtr);
+            reader.readFully(block, 0, size);
+            var kindInt = block[0] & 0xFF;
+            if (kindInt >= BTreeNodeKind.values().length) throw new InvalidBTreeNodeKindException();
+            var kind = BTreeNodeKind.values()[kindInt];
+            var num = block[1] & 0xFF;
+            if (num > BTREE_SLOT_COUNT) throw new InvalidBTreeNodeException();
+            if (kind == BTreeNodeKind.BRANCH && size < branchBlockSize) throw new EndOfStreamException();
+
+            int i = 0;
+            switch (kind) {
                 case LEAF -> {
-                    var position = nodePtr + BTREE_NODE_HEADER_SIZE + rem * Slot.length;
-                    return new SlotPointer(position, node.values[(int) rem]);
+                    if (rem >= num) throw new InvalidBTreeNodeException();
+                    i = (int) rem;
                 }
                 case BRANCH -> {
-                    int i = 0;
-                    while (i + 1 < node.num && rem >= node.counts[i]) {
-                        rem -= node.counts[i];
+                    while (i + 1 < num) {
+                        var count = buffer.getLong(countsPos + i * 8);
+                        if (rem < count) break;
+                        rem -= count;
                         i++;
                     }
-                    nodePtr = node.children[i].value();
                 }
             }
+
+            int slotPos = BTREE_NODE_HEADER_SIZE + i * Slot.length;
+            var slot = Slot.fromBytes(Arrays.copyOfRange(block, slotPos, slotPos + Slot.length));
+            if (kind == BTreeNodeKind.LEAF) return new SlotPointer(nodePtr + slotPos, slot);
+            nodePtr = slot.value();
         }
     }
 
@@ -2912,7 +2934,7 @@ public class Database {
     }
 
     // descend by key to the matching leaf entry, or null
-    private SortedSlot sortedGet(long rootPtr, byte[] key) throws IOException {
+    private Slot sortedGet(long rootPtr, byte[] key) throws IOException {
         var nodePtr = rootPtr;
         while (true) {
             var node = readSortedNode(nodePtr);
@@ -2920,30 +2942,10 @@ public class Database {
                 case LEAF -> {
                     var search = sortedLeafSearch(node, key);
                     if (!search.found()) return null;
-                    return new SortedSlot(node.entries[search.index()], nodePtr + BTREE_NODE_HEADER_SIZE + (long) search.index() * Slot.length);
+                    return node.entries[search.index()];
                 }
                 case BRANCH -> {
                     int i = sortedBranchSearch(node, key);
-                    nodePtr = node.children[i].value();
-                }
-            }
-        }
-    }
-
-    // descend by rank to the leaf entry at the given 0-based index
-    private SortedSlot sortedGetByIndex(long rootPtr, long rank) throws IOException {
-        var nodePtr = rootPtr;
-        var rem = rank;
-        while (true) {
-            var node = readSortedNode(nodePtr);
-            switch (node.kind) {
-                case LEAF -> {
-                    int i = (int) rem;
-                    return new SortedSlot(node.entries[i], nodePtr + BTREE_NODE_HEADER_SIZE + (long) i * Slot.length);
-                }
-                case BRANCH -> {
-                    int i = 0;
-                    while (i + 1 < node.num && rem >= node.counts[i]) { rem -= node.counts[i]; i++; }
                     nodePtr = node.children[i].value();
                 }
             }
