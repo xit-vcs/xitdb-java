@@ -1881,12 +1881,12 @@ class HighLevelDatabaseTest {
     }
 
     // checks that no committed byte has changed since `committed` was read,
-    // except the root header (the root slot and file size after the database
+    // except the root header (the padding and file size after the database
     // header). then replicates and checks that the replica is identical.
     // returns the bytes that are committed now.
     static byte[] expectAppendOnlyAndReplicate(Database source, Database replica, byte[] committed) throws Exception {
         var rootHeaderStart = Database.Header.length;
-        var rootHeaderEnd = rootHeaderStart + 17;
+        var rootHeaderEnd = rootHeaderStart + 12;
         var current = readCommittedBytes(source, 0);
         assertTrue(current.length >= committed.length);
         assertArrayEquals(Arrays.copyOfRange(committed, 0, rootHeaderStart), Arrays.copyOfRange(current, 0, rootHeaderStart));
@@ -1928,17 +1928,17 @@ class HighLevelDatabaseTest {
         // a new database is its header (which ends with its file ID), its root
         // header, and the trailer for its empty root: the slot (9 zero bytes), the commit ID (0 for
         // the first commit), then the CRC-64/XZ of the file ID, the trailer's position
-        // (37), the slot, and the commit ID
+        // (32), the slot, and the commit ID
         {
             var bytes = readCommittedBytes(source, 0);
-            assertEquals(62, bytes.length);
+            assertEquals(57, bytes.length);
             assertArrayEquals(new byte[]{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}, Arrays.copyOfRange(bytes, 12, 20));
             assertArrayEquals(new byte[]{
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, (byte) 0xd6, 0x18, 0x4e, 0x46, (byte) 0xb4, 0x7d, 0x29,
-                0x26,
-            }, Arrays.copyOfRange(bytes, 37, bytes.length));
+                0x00, (byte) 0x95, (byte) 0xd4, (byte) 0x94, (byte) 0xc3, 0x4d, (byte) 0xf8, 0x07,
+                (byte) 0xe5,
+            }, Arrays.copyOfRange(bytes, 32, bytes.length));
         }
 
         // new databases have their own random file IDs, so the
