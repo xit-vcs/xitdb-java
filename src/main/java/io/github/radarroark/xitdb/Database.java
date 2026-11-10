@@ -110,20 +110,27 @@ public class Database {
         this.md = newDigest(hasher.md());
         this.txStart = null;
 
-        core.seek(0);
+        // a database whose first commit never finished holds nothing. if it is no
+        // bigger than a new database, it was interrupted while being created, so
+        // it is created again. otherwise it is a full copy that was interrupted
+        // (see openReplicated), which is left for the next sync to replace.
+        var hasCommit = false;
+        if (core.length() > 0) {
+            this.header = readAndValidateHeader();
+            hasCommit = readFileSize() > 0;
+            var newSize = fileSizeStart(this.header.version()) + 8 + RootTrailer.length;
+            if (!hasCommit && core.length() <= newSize) core.setLength(0);
+        }
+
         if (core.length() == 0) {
             this.header = new Header(fileId != null ? fileId : RANDOM.nextLong(), hasher.id(), (short)this.md.getDigestLength(), VERSION, MAGIC_NUMBER);
-            this.header.write(core);
-            var writer = core.writer();
-            // write the root header and commit an empty root, so the
-            // file ends with a trailer like after any transaction
-            writer.write(new byte[FILE_SIZE_START + 8 - ROOT_HEADER_START]);
-            // the first commit's ID is 0, so a new database's bytes only
-            // depend on its file ID
+            writeHeaders();
+            // commit an empty root, so the file ends with a trailer like after
+            // any transaction. the first commit's ID is 0, so a new database's
+            // bytes only depend on its file ID
             commitRoot(new Slot(), 0);
             this.core.sync();
-        } else {
-            this.header = readAndValidateHeader();
+        } else if (hasCommit) {
             committedSize();
         }
     }
@@ -167,11 +174,15 @@ public class Database {
     private Header readAndValidateHeader() throws IOException {
         core.seek(0);
         var header = Header.read(core);
+        validateHeader(header);
+        return header;
+    }
+
+    private void validateHeader(Header header) {
         header.validate();
         if (header.hashSize() != this.md.getDigestLength()) {
             throw new InvalidHashSizeException();
         }
-        return header;
     }
 
     public WriteCursor rootCursor() throws IOException {
@@ -282,6 +293,8 @@ public class Database {
 
     /** this database's ReplicaState. */
     public ReplicaState replicaState() throws IOException {
+        // a full copy that didn't finish has no first commit (see openReplicated)
+        if (readFileSize() == 0) return new ReplicaState(0, 0);
         var committedSize = committedSize();
         return new ReplicaState(committedSize, readRootTrailer(committedSize).checksum());
     }
@@ -323,7 +336,7 @@ public class Database {
      */
     public InputStream openCommitted(long start, long end) throws IOException {
         if (start < 0 || start > end || end > committedSize()) throw new InvalidRangeException();
-        var fileSizeStart = fileSizeStart();
+        var fileSizeStart = fileSizeStart(this.header.version());
         var dataStart = fileSizeStart + 8;
         if (start > 0 && start < dataStart) throw new InvalidRangeException();
 
@@ -391,12 +404,15 @@ public class Database {
      * like applyReplicated, but returns a stream to write the len bytes to. they are written to this database as they arrive, and
      * close commits them. if fewer than len bytes were written, or they don't end
      * with a trailer, close throws and the database stays at its last commit.
-     * when start is 0, this database is truncated now and replaced by the bytes.
+     * when start is 0, this database is replaced by the bytes once their headers
+     * have arrived. its root header stays empty until the rest has arrived, so a
+     * copy that doesn't finish is a database without a first commit (see the
+     * constructor), which the next sync replaces.
      */
     public OutputStream openReplicated(long start, long len) throws IOException {
         if (len < 0) throw new InvalidRangeException();
         if (start == 0) {
-            this.core.setLength(0);
+            if (len < Header.length) throw new InvalidRangeException();
         } else if (start == committedSize()) {
             // discard anything past the committed bytes, such as the remains of an interrupted sync
             this.truncate();
@@ -407,12 +423,49 @@ public class Database {
         return new OutputStream() {
             long written = 0;
             boolean closed = false;
+            boolean failed = false;
+            // when start is 0, the database header and root header that come first.
+            // version 1's root header is the biggest.
+            byte[] headers = start == 0 ? new byte[Header.length + Slot.length + 8] : null;
+            // where the headers end, once the database header has arrived
+            long headersEnd = -1;
 
             @Override
             public void write(byte[] buffer, int off, int n) throws IOException {
                 Objects.checkFromIndexSize(off, n, buffer.length);
                 if (closed) throw new IOException("stream closed");
+                if (failed) throw new IOException("stream failed");
                 if (n > len - written) throw new InvalidRangeException();
+                try {
+                    while (headers != null && n > 0) {
+                        var k = (int) Math.min(n, (headersEnd < 0 ? Header.length : headersEnd) - written);
+                        System.arraycopy(buffer, off, headers, (int) written, k);
+                        written += k;
+                        off += k;
+                        n -= k;
+                        if (headersEnd < 0 && written == Header.length) {
+                            var header = Header.fromBytes(headers);
+                            validateHeader(header);
+                            headersEnd = fileSizeStart(header.version()) + 8;
+                            if (len < headersEnd) throw new InvalidRangeException();
+                        }
+                        if (written == headersEnd) {
+                            // the bytes are a different database, with its own header
+                            core.setLength(0);
+                            Database.this.header = Header.fromBytes(headers);
+                            writeHeaders();
+                            // sync the headers before the data, which could otherwise reach
+                            // the disk without them and leave a file that can't be opened.
+                            // the root header that came with the bytes isn't needed.
+                            core.sync();
+                            headers = null;
+                        }
+                    }
+                } catch (IOException | RuntimeException e) {
+                    failed = true;
+                    throw e;
+                }
+                if (n == 0) return;
                 core.seek(start + written);
                 // not every core implements write(byte[], int, int)
                 core.writer().write(off == 0 && n == buffer.length ? buffer : Arrays.copyOfRange(buffer, off, off + n));
@@ -428,7 +481,7 @@ public class Database {
             public void close() throws IOException {
                 if (closed) return;
                 closed = true;
-                if (written != len) throw new EndOfStreamException();
+                if (failed || written != len) throw new EndOfStreamException();
                 commitReplicated(start, len);
             }
         };
@@ -436,12 +489,7 @@ public class Database {
 
     // commits len bytes written at start by a replication stream
     private void commitReplicated(long start, long len) throws IOException {
-        if (start == 0) {
-            // the bytes are a different database, with its own header
-            this.core.sync();
-            this.header = readAndValidateHeader();
-            committedSize();
-        } else if (len > 0) {
+        if (len > 0) {
             // the bytes must end with a trailer. update the root header to match it.
             readRootTrailer(start + len);
             this.core.sync();
@@ -481,13 +529,30 @@ public class Database {
 
     // where the root header's file size is. the committed data starts after it.
     // version 1 has a copy of the root slot before it, which isn't used or updated.
-    private long fileSizeStart() {
-        return this.header.version() == 1 ? ROOT_HEADER_START + Slot.length : FILE_SIZE_START;
+    private static long fileSizeStart(short version) {
+        return version == 1 ? ROOT_HEADER_START + Slot.length : FILE_SIZE_START;
+    }
+
+    // writes the database header and an empty root header. the database has
+    // no first commit until the root header is given its file size.
+    private void writeHeaders() throws IOException {
+        this.core.seek(0);
+        this.header.write(this.core);
+        this.core.writer().write(new byte[(int) (fileSizeStart(this.header.version()) + 8 - ROOT_HEADER_START)]);
+    }
+
+    // the root header's file size. it is 0 until the first commit or full copy
+    // has finished, including when the file was cut off before it.
+    private long readFileSize() throws IOException {
+        var fileSizeStart = fileSizeStart(this.header.version());
+        if (this.core.length() < fileSizeStart + 8) return 0;
+        this.core.seek(fileSizeStart);
+        return this.core.reader().readLong();
     }
 
     // the file size from the root header, and the root slot from the trailer it points to
     RootHeader readRootHeader() throws IOException {
-        var fileSizeStart = fileSizeStart();
+        var fileSizeStart = fileSizeStart(this.header.version());
         this.core.seek(fileSizeStart);
         var bytes = new byte[8];
         this.core.reader().readFully(bytes);
@@ -539,7 +604,7 @@ public class Database {
     // points the root header at the trailer that ends the file.
     private void writeRootHeader() throws IOException {
         var fileSize = this.core.length();
-        this.core.seek(fileSizeStart());
+        this.core.seek(fileSizeStart(this.header.version()));
         // one 8-byte write, so a concurrent reader never sees part of it
         this.core.writer().write(ByteBuffer.allocate(8).putLong(fileSize).array());
     }
@@ -750,6 +815,19 @@ public class Database {
             buffer.putInt(this.hashId);
             buffer.putLong(this.fileId);
             return buffer.array();
+        }
+
+        public static Header fromBytes(byte[] bytes) {
+            var buffer = ByteBuffer.wrap(bytes);
+            var magicNumber = new byte[3];
+            buffer.get(magicNumber);
+            // currently unused
+            buffer.get();
+            var version = buffer.getShort();
+            var hashSize = buffer.getShort();
+            var hashId = buffer.getInt();
+            var fileId = buffer.getLong();
+            return new Header(fileId, hashId, hashSize, version, magicNumber);
         }
 
         public static Header read(Core core) throws IOException {

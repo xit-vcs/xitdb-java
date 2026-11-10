@@ -670,3 +670,5 @@ Only change a replica with `applyReplicated`. If you write to it directly, it no
 ## Thread Safety
 
 It is possible to read the database from multiple threads without locks, even while writes are happening. This is a big benefit of immutable databases. However, each thread needs to use its own `Database` instance. You can do this by creating a `ThreadLocal`. See [the multithreading test](https://github.com/xit-vcs/xitdb-java/blob/d7cf0869cf0f66eca823051dfbdec0ab5e5a09cb/src/test/java/io/github/radarroark/xitdb/DatabaseTest.java#L201) for an example of this. Also, keep in mind that writes still need to come from one thread at a time; see the example at the top of this file, where it acquires an exclusive file lock.
+
+When a thread or process only reads, open its file in read-only mode, such as with `CoreReadOnlyFile`. Otherwise, creating its `Database` could write to the file: an empty file becomes a new database, and so does one whose creation was interrupted. That must not happen while another process is creating the database, or replacing it with `applyReplicated`.
