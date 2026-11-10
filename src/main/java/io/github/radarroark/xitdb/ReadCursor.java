@@ -176,10 +176,13 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
     public KeyValuePairCursor readKeyValuePair() throws IOException {
         var slotPtr = resolved();
         var kvPair = this.db.readKvPair(slotPtr.slot());
+        // a key-only entry is its own key slot, so its key is where the entry is
+        var keyPosition = this.db.kvKeyPosition(slotPtr.slot());
+        if (keyPosition == null) keyPosition = slotPtr.position();
 
         return new KeyValuePairCursor(
             new ReadCursor(new SlotPointer(this.db.kvValuePosition(slotPtr.slot()), kvPair.valueSlot()), this.db),
-            new ReadCursor(new SlotPointer(this.db.kvKeyPosition(slotPtr.slot()), kvPair.keySlot()), this.db),
+            new ReadCursor(new SlotPointer(keyPosition, kvPair.keySlot()), this.db),
             kvPair.hash()
         );
     }
