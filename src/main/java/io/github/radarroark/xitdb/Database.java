@@ -2735,10 +2735,11 @@ public class Database {
         }
 
         var slotPtr = readArrayListSlot(indexPos, key, nextShift, writeMode, frozenAt);
-        // clear values left by a rollback or slice
+        // clear values left by a rollback or slice. the slot is written as a NONE
+        // slot marked full, so it counts as an element even if nothing is written to it.
         slotPtr = slotPtr.withSlot(new Slot());
         this.core.seek(slotPtr.position());
-        writer.write(slotPtr.slot().toBytes());
+        writer.write(new Slot(0, Tag.NONE, true).toBytes());
         return new ArrayListAppendResult(new ArrayListHeader(indexPos, header.size() + 1), slotPtr);
     }
 

@@ -79,7 +79,8 @@ class LowLevelDatabaseTest {
         }));
         assertArrayEquals(new byte[16], frozen[0].readBytes(MAX_READ_BYTES));
         assertEquals(Tag.NONE, history.appendCursor().slot().tag());
-        assertEquals(null, history.getSlot(-1));
+        // the cleared slot still counts as an element
+        assertEquals(new Slot(0, Tag.NONE, true), history.getSlot(-1));
         assertThrows(AssertionError.class, () -> history.appendContext(new Database.Bytes(new byte[16]), cursor -> {
             throw new AssertionError();
         }));
