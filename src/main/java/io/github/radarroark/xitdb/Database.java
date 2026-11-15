@@ -2334,6 +2334,7 @@ public class Database {
         var node = readBTreeNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
+                if (rank > node.num) throw new InvalidBTreeNodeException();
                 // build the entries with a placeholder spliced in at `rank`. the
                 // placeholder is a NONE slot marked full so that, if the caller never
                 // writes a value (e.g. appendCursor), iteration still counts it as an
@@ -2434,6 +2435,7 @@ public class Database {
         var node = readBTreeNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
+                if (rank >= node.num) throw new InvalidBTreeNodeException();
                 var newPtr = btreeReusable(nodePtr, frozenAt) ? nodePtr : writeBTreeNode(node);
                 return new BTreeWriteSlot(newPtr, newPtr + BTREE_NODE_HEADER_SIZE + rank * Slot.length, node.values[(int) rank]);
             }
@@ -2465,6 +2467,7 @@ public class Database {
         var node = readBTreeNode(nodePtr);
         switch (node.kind) {
             case LEAF -> {
+                if (rank >= node.num) throw new InvalidBTreeNodeException();
                 int r = (int) rank;
                 System.arraycopy(node.values, r + 1, node.values, r, node.num - 1 - r);
                 node.num -= 1;
@@ -2687,6 +2690,7 @@ public class Database {
         var node = readBTreeNode(rootPtr);
         switch (node.kind) {
             case LEAF -> {
+                if (rank > node.num) throw new InvalidBTreeNodeException();
                 int r = (int) rank;
                 var left = new BTreeNode(BTreeNodeKind.LEAF, r);
                 System.arraycopy(node.values, 0, left.values, 0, r);

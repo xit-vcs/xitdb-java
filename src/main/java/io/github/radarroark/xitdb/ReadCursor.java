@@ -503,6 +503,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 var position = nodePtr + Database.BTREE_NODE_HEADER_SIZE;
                 switch (node.kind) {
                     case LEAF -> {
+                        if (rem >= node.num) throw new Database.InvalidBTreeNodeException();
                         stack.add(new Level(position, node.entries, (byte) rem));
                         return stack;
                     }
@@ -546,6 +547,7 @@ public class ReadCursor implements Slotted, Iterable<ReadCursor> {
                 var position = nodePtr + Database.BTREE_NODE_HEADER_SIZE;
                 switch (node.kind) {
                     case LEAF -> {
+                        if (rem >= node.num) throw new Database.InvalidBTreeNodeException();
                         stack.add(new Level(position, node.values, (byte) rem));
                         return stack;
                     }
