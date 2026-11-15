@@ -149,10 +149,6 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
             this.memoryPos = this.filePos;
         }
 
-        if (this.fileLen == null) {
-            this.fileLen = this.file.length();
-        }
-
         if (this.filePos >= this.memoryPos && this.filePos - this.memoryPos + buffer.length <= this.bufferSize) {
             // write to the in-memory buffer
             this.memory.writeAt((int) (this.filePos - this.memoryPos), buffer);
@@ -163,6 +159,12 @@ public class RandomAccessBufferedFile implements DataOutput, DataInput, AutoClos
                 this.flush();
             }
             writeToFile(this.filePos, buffer, 0, buffer.length);
+        }
+
+        // cache the file's length only after a successful write. a failed
+        // one may leave nothing to flush, so nothing would clear it.
+        if (this.fileLen == null) {
+            this.fileLen = this.file.length();
         }
 
         this.filePos += buffer.length;
